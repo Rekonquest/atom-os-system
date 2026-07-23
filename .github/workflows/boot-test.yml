@@ -1,0 +1,76 @@
+name: Boot Test
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  boot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools-preview
+
+      - name: Install bootimage
+        run: cargo install bootimage
+
+      - name: Install QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+
+      - name: Checkout field substrate (kernel path deps)
+        run: git clone --depth 1 https://github.com/Rekonquest/atom-os-field-substrate.git "$GITHUB_WORKSPACE/../ATOM OS"
+
+      - name: Checkout kernel @ last bootable commit
+        run: |
+          git clone https://github.com/Lucerna-Labs/atom-os-kernel.git "$GITHUB_WORKSPACE/../atom-os-kernel"
+          git -C "$GITHUB_WORKSPACE/../atom-os-kernel" checkout b8540ed
+
+      - name: Build userspace programs
+        run: |
+          for p in hello daemon shell fieldmon; do
+            (cd "programs/$p" && cargo +nightly build -Zjson-target-spec --release)
+          done
+
+      - name: Install userspace into kernel image paths
+        run: |
+          REL="$GITHUB_WORKSPACE/../atom-os-kernel/target/x86_64-os/release"
+          mkdir -p "$REL"
+          cp target/x86_64-atom-user/release/shell "$REL/payload"
+          cp target/x86_64-atom-user/release/daemon "$REL/daemon"
+
+      - name: Build bootimage
+        run: cargo +nightly bootimage -Zjson-target-spec --release
+        working-directory: ../atom-os-kernel/x86_64-kernel
+
+      - name: Boot QEMU and capture serial
+        working-directory: ../atom-os-kernel
+        run: |
+          timeout 30 qemu-system-x86_64 \
+            -drive format=raw,file=target/x86_64-os/release/bootimage-x86_64-kernel.bin \
+            -display none \
+            -serial file:qemu.log || true
+
+          echo "==== SERIAL LOG ===="
+          cat qemu.log || true
+
+          fail=0
+          if grep -q "ATOM OS System shell" qemu.log; then
+            echo "BANNER_OK"
+          else
+            echo "BANNER_MISSING"; fail=1
+          fi
+          if grep -q "10,000 SYS_YIELDs took" qemu.log; then
+            echo "BENCH_OK"
+          else
+            echo "BENCH_MISSING"; fail=1
+          fi
+          if grep -q "Daemon" qemu.log; then
+            echo "DAEMON_OK"
+          else
+            echo "DAEMON_MISSING (non-fatal)"
+          fi
+          exit $fail
