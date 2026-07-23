@@ -19,6 +19,7 @@ cd "$BUILD"
 git clone --quiet https://github.com/Rekonquest/atom-os-field-substrate.git "ATOM OS"
 git clone --quiet https://github.com/Lucerna-Labs/atom-os-kernel.git
 git -C atom-os-kernel checkout --quiet "$BOOT_COMMIT"
+git -C atom-os-kernel apply "$SYSROOT/patches/0001-int80-yield-use-switch-result.patch"
 
 for p in hello daemon shell fieldmon; do
     (cd "$SYSROOT/programs/$p" && cargo +nightly build -Zjson-target-spec --release --quiet)

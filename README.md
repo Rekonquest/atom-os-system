@@ -5,24 +5,39 @@ Zero external dependencies — `core` + `alloc` only.
 
 ## Status (read this first)
 
-**Statically checked, never booted.** Everything below has passed host
-unit tests and static ELF header/program-header checks against the
-kernel loader's requirements. **No binary from this project has ever
-executed on the kernel.** There is no QEMU smoke gate yet. Words like
-"works" are earned by `scripts\install-to-kernel.ps1 -Force` + a kernel
-rebuild + a QEMU boot with serial capture — none of which has happened.
+**Boot-tested on GitHub Actions (2026-07-23, run 30032503929): PASS.**
+The workflow `.github/workflows/boot-test.yml` clones
+`atom-os-kernel@b8540ed` + the field substrate, builds this userspace
+from source, embeds it via the kernel's `include_bytes!` paths, builds
+the bootimage, boots QEMU, and greps serial output. Observed on the
+passing run:
 
-Known kernel-side blockers that this userspace cannot fix (found by
-adversarial review, 2026-07-23):
+```
+Booting Fearless Hypatia...
+Field substrate Initialized.
+Ring 3 Multi-Tasking Spawned.
+ATOM OS System shell (type 'help')
+10,000 SYS_YIELDs took (CPU cycles): 177274864
+> [Daemon] Heartbeat... [Daemon] Heartbeat...
+```
 
-- **SYS_EXEC does not reload CR3 or reset registers on the int-0x80
-  path** — `run <file>` from the shell is unreliable until the kernel
-  handler is fixed (kernel-orchestrator `syscall.rs:316`,
-  x86_64-kernel `main.rs:488-508`).
-- **The int-0x80 YIELD path discards `switch_context`'s return value**
-  (`main.rs:491`), a scheduler state desync in the same family as the
-  old GAP-5 bug. The daemon issues 500k yields per loop and stresses
-  this path hard.
+Gates: `BANNER_OK`, `BENCH_OK`, `DAEMON_OK` — shell (pid 1) and daemon
+(pid 2) both schedule and produce output.
+
+**Required kernel patch:** `patches/0001-int80-yield-use-switch-result.patch`
+(applied by the workflow after checkout). Without it, the kernel's
+int-0x80 handler discards `switch_context`'s return value
+(`x86_64-kernel/src/main.rs:416` @ b8540ed): the CPU always resumes the
+yielding task while scheduler bookkeeping advances, so pid 1 is starved
+forever — the shell never prints. This was found by this project's
+runtime test and is a kernel-side bug, not a userspace one. The patch
+is not yet applied to `atom-os-kernel` itself; landing it there is an
+operator action.
+
+Remaining unproven surfaces: interactive keyboard input (CI injects
+none), `run`/SYS_EXEC (kernel-side CR3/register reset gap),
+`hello.elf`/`fieldmon.elf` exec from RamFS (kernel injects only
+shell/daemon), the `.bss` heap path (no shipped program allocates).
 
 ## What this is
 
@@ -64,7 +79,13 @@ Host unit tests for the pure parts of atom-rt (u64/fixed-6 formatting,
 command tokenizer, bump-allocator pointer math). These tests exercise
 **no** syscall, **no** I/O, and none of the programs' logic.
 
-## Boot (operator action, never yet performed)
+## Boot (GitHub Actions — the proven path)
+
+Push to `main` or dispatch the `Boot Test` workflow; it reproduces the
+verified boot end-to-end in ~6 minutes. A Codespaces variant of the
+same flow lives in `scripts/codespace-boot-test.sh`.
+
+## Boot (local, operator action)
 
 The unmodified kernel embeds whatever binaries sit at
 `target\x86_64-os\release\{payload,daemon}` via `include_bytes!` and

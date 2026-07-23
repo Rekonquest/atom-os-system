@@ -10,9 +10,8 @@ source workspace) and the kernel's own `ATOM-STACK-KERNEL-DESIGN.md`.
 |---|---|
 | fmt / shell_parse / heap (pure) | 16 host unit tests pass |
 | ELF output vs loader requirements | static header/PHDR checks (`scripts\check-elf.ps1`) pass |
-| Syscall ABI table below | cross-checked by reading kernel dispatch; never executed |
-| sys.rs, io.rs, all four programs | no tests, no runtime evidence |
-| End-to-end boot | never performed |
+| Boot: kernel init, shell banner, auto-bench, prompt, daemon heartbeat | QEMU boot on GitHub Actions, run 30032503929 (2026-07-23), gates BANNER/BENCH/DAEMON all OK — requires `patches/0001-int80-yield-use-switch-result.patch` on kernel b8540ed |
+| Interactive input, `run`/exec, hello/fieldmon from RamFS, .bss heap path | not yet exercised at runtime |
 
 ## Layers
 
