@@ -7,6 +7,10 @@ on:
         description: 'program to install as daemon.elf (daemon, hello)'
         required: false
         default: 'daemon'
+      payload_image:
+        description: 'program to install as payload (shell, hello)'
+        required: false
+        default: 'shell'
   push:
 
 jobs:
@@ -14,6 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       DAEMON_IMAGE: ${{ inputs.daemon_image || 'daemon' }}
+      PAYLOAD_IMAGE: ${{ inputs.payload_image || 'shell' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -46,9 +51,9 @@ jobs:
         run: |
           REL="$GITHUB_WORKSPACE/../atom-os-kernel/target/x86_64-os/release"
           mkdir -p "$REL"
-          cp target/x86_64-atom-user/release/shell "$REL/payload"
+          cp "target/x86_64-atom-user/release/$PAYLOAD_IMAGE" "$REL/payload"
           cp "target/x86_64-atom-user/release/$DAEMON_IMAGE" "$REL/daemon"
-          echo "daemon image: $DAEMON_IMAGE"
+          echo "payload image: $PAYLOAD_IMAGE / daemon image: $DAEMON_IMAGE"
 
       - name: Build bootimage
         run: cargo +nightly bootimage -Zjson-target-spec --release
