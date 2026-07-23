@@ -2,11 +2,18 @@ name: Boot Test
 
 on:
   workflow_dispatch:
+    inputs:
+      daemon_image:
+        description: 'program to install as daemon.elf (daemon, hello)'
+        required: false
+        default: 'daemon'
   push:
 
 jobs:
   boot:
     runs-on: ubuntu-latest
+    env:
+      DAEMON_IMAGE: ${{ inputs.daemon_image || 'daemon' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -40,7 +47,8 @@ jobs:
           REL="$GITHUB_WORKSPACE/../atom-os-kernel/target/x86_64-os/release"
           mkdir -p "$REL"
           cp target/x86_64-atom-user/release/shell "$REL/payload"
-          cp target/x86_64-atom-user/release/daemon "$REL/daemon"
+          cp "target/x86_64-atom-user/release/$DAEMON_IMAGE" "$REL/daemon"
+          echo "daemon image: $DAEMON_IMAGE"
 
       - name: Build bootimage
         run: cargo +nightly bootimage -Zjson-target-spec --release
