@@ -1,0 +1,9 @@
+{
+  "name": "ATOM OS System",
+  "image": "mcr.microsoft.com/devcontainers/rust:latest",
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+  "postCreateCommand": "rustup toolchain install nightly --component rust-src llvm-tools-preview --profile minimal",
+  "remoteUser": "vscode"
+}

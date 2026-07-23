@@ -1,0 +1,9 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/atom-rt",
+    "programs/hello",
+    "programs/daemon",
+    "programs/shell",
+    "programs/fieldmon",
+]
