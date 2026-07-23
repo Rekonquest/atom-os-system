@@ -41,6 +41,9 @@ jobs:
           git clone https://github.com/Lucerna-Labs/atom-os-kernel.git "$GITHUB_WORKSPACE/../atom-os-kernel"
           git -C "$GITHUB_WORKSPACE/../atom-os-kernel" checkout b8540ed
 
+      - name: Apply kernel int-0x80 yield-switch fix
+        run: git -C "$GITHUB_WORKSPACE/../atom-os-kernel" apply "$GITHUB_WORKSPACE/patches/0001-int80-yield-use-switch-result.patch"
+
       - name: Build userspace programs
         run: |
           for p in hello daemon shell fieldmon; do
