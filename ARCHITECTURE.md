@@ -13,7 +13,7 @@ source workspace) and the kernel's own `ATOM-STACK-KERNEL-DESIGN.md`.
 | Boot: kernel init, shell banner, HEAP_OK, auto-bench, prompt, daemon heartbeat | QEMU boot + serial gates |
 | Interactive keyboard (`help`) | QEMU QMP `send-key` → `KEYBOARD_OK` |
 | RamFS inject of hello.elf / fieldmon.elf | `ls` → `RAMFS_OK` (requires patch 0002) |
-| `run hello.elf` / SYS_EXEC | QMP-typed `run` → `EXEC_OK` (requires patch 0002) |
+| `run hello.elf` / SYS_EXEC | still #GPs at runtime in stock kernel; patch 0002 is partial |
 | `.bss` heap path on target | shell allocates `Vec` at boot → `HEAP_OK` |
 
 ## Layers

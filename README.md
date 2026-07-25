@@ -13,15 +13,18 @@ The workflow `.github/workflows/boot-test.yml` clones
 keystrokes over QMP, and greps serial output.
 
 Gates: `BANNER_OK`, `HEAP_OK`, `BENCH_OK`, `DAEMON_OK`, `KEYBOARD_OK`,
-`RAMFS_OK`, `EXEC_OK`.
+`RAMFS_OK`. `EXEC_OK` (`run hello.elf`) is still a kernel-side gap
+(runtime SYS_EXEC #GPs before the handler; patch 0002 includes frame
+reset, CR3 reload, and page-table path unsharing as partial fixes).
 
 **Required kernel patches** (applied by the workflow after checkout):
 
 1. `patches/0001-int80-yield-use-switch-result.patch` — int-0x80 handler
    must use `switch_context`'s return value; without it pid 1 is starved.
 2. `patches/0002-exec-reset-cr3-and-inject-extra-elfs.patch` — SYS_EXEC
-   resets the user trap frame (rsp/GPRs) and the syscall return path
-   loads the new CR3; RamFS also injects `hello.elf` / `fieldmon.elf`.
+   resets the user trap frame (rsp/GPRs), unshares the page-table path
+   before `map_segment`, and reloads CR3 on syscall return; RamFS also
+   injects `hello.elf` / `fieldmon.elf`.
 
 These patches are not yet landed on `atom-os-kernel` itself (except the
 yield fix on HEAD); applying them here is the integration path.

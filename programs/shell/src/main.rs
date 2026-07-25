@@ -134,8 +134,6 @@ fn cmd_edit(name: &[u8]) {
 }
 
 fn prove_heap() {
-    // Force a real `.bss` allocation path through the bump allocator so the
-    // shipped ELF retains a NOBITS segment for the kernel loader to zero-fill.
     let mut marker: Vec<u8> = Vec::new();
     marker.extend_from_slice(b"HEAP_OK");
     io::print_bytes(&marker);

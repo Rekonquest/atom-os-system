@@ -1,8 +1,97 @@
+diff --git a/kernel-kit/src/paging.rs b/kernel-kit/src/paging.rs
+index 0700bce..22c7209 100644
+--- a/kernel-kit/src/paging.rs
++++ b/kernel-kit/src/paging.rs
+@@ -164,6 +164,73 @@ pub fn duplicate_pml4(active_cr3: u64) -> Option<u64> {
+     Some(new_pml4_phys)
+ }
+ 
++
++/// Clone every level of the page-table walk for `vaddr` so subsequent
++/// `map_segment` stores into private tables. `duplicate_pml4` is shallow —
++/// without this, runtime SYS_EXEC overwrites leaf PTEs shared with the
++/// caller's (and possibly the kernel's) page tables and #GPs.
++pub fn unshare_page_path(pml4_phys: u64, vaddr: u64) {
++    let va = VirtualAddress(vaddr);
++    unsafe {
++        let pml4 = &mut *(phys_to_virt(pml4_phys) as *mut PageTable);
++        let p4 = pml4.entries[va.p4_index()].0;
++        if (p4 & 1) == 0 {
++            return;
++        }
++        let old_pdpt = p4 & 0x000FFFFFFFFFF000;
++        let (fa, sif) = crate::memory::FRAME_ALLOCATOR.lock();
++        let new_pdpt = match fa.alloc_frame() {
++            Some(f) => f,
++            None => { crate::memory::FRAME_ALLOCATOR.unlock(sif); return; }
++        };
++        crate::memory::FRAME_ALLOCATOR.unlock(sif);
++        core::ptr::copy_nonoverlapping(
++            phys_to_virt(old_pdpt) as *const PageTable,
++            phys_to_virt(new_pdpt) as *mut PageTable,
++            1,
++        );
++        pml4.entries[va.p4_index()].0 = new_pdpt | (p4 & 0xFFF);
++
++        let pdpt = &mut *(phys_to_virt(new_pdpt) as *mut PageTable);
++        let p3 = pdpt.entries[va.p3_index()].0;
++        if (p3 & 1) == 0 {
++            return;
++        }
++        let old_pd = p3 & 0x000FFFFFFFFFF000;
++        let (fa, sif) = crate::memory::FRAME_ALLOCATOR.lock();
++        let new_pd = match fa.alloc_frame() {
++            Some(f) => f,
++            None => { crate::memory::FRAME_ALLOCATOR.unlock(sif); return; }
++        };
++        crate::memory::FRAME_ALLOCATOR.unlock(sif);
++        core::ptr::copy_nonoverlapping(
++            phys_to_virt(old_pd) as *const PageTable,
++            phys_to_virt(new_pd) as *mut PageTable,
++            1,
++        );
++        pdpt.entries[va.p3_index()].0 = new_pd | (p3 & 0xFFF);
++
++        let pd = &mut *(phys_to_virt(new_pd) as *mut PageTable);
++        let p2 = pd.entries[va.p2_index()].0;
++        if (p2 & 1) == 0 {
++            return;
++        }
++        let old_pt = p2 & 0x000FFFFFFFFFF000;
++        let (fa, sif) = crate::memory::FRAME_ALLOCATOR.lock();
++        let new_pt = match fa.alloc_frame() {
++            Some(f) => f,
++            None => { crate::memory::FRAME_ALLOCATOR.unlock(sif); return; }
++        };
++        crate::memory::FRAME_ALLOCATOR.unlock(sif);
++        core::ptr::copy_nonoverlapping(
++            phys_to_virt(old_pt) as *const PageTable,
++            phys_to_virt(new_pt) as *mut PageTable,
++            1,
++        );
++        pd.entries[va.p2_index()].0 = new_pt | (p2 & 0xFFF);
++    }
++}
++
+ /// Maps a contiguous virtual slice to a contiguous physical slice in the given PML4.
+ pub fn map_segment(pml4_phys: u64, vaddr: u64, paddr: u64, size: usize) {
+     let mut current_vaddr = vaddr & !(PAGE_SIZE as u64 - 1);
 diff --git a/kernel-orchestrator/src/syscall.rs b/kernel-orchestrator/src/syscall.rs
-index 7157588..d9bb3e0 100644
+index 7157588..7856afa 100644
 --- a/kernel-orchestrator/src/syscall.rs
 +++ b/kernel-orchestrator/src/syscall.rs
-@@ -312,16 +312,38 @@ pub fn dispatch(ctx: &mut Context, mem: &mut MemoryPool) {
+@@ -222,6 +222,10 @@ pub fn dispatch(ctx: &mut Context, mem: &mut MemoryPool) {
+                             
+                             let active_cr3 = kernel_kit::paging::Cr3::read();
+                             if let Some(new_cr3) = kernel_kit::paging::duplicate_pml4(active_cr3) {
++                                // Private page-table path for user image + stack so
++                                // map_segment does not mutate tables shared with the caller.
++                                kernel_kit::paging::unshare_page_path(new_cr3, 0xFFFFFFFF80100000);
++                                kernel_kit::paging::unshare_page_path(new_cr3, 0xFFFFFFFF800FE000);
+                                 // PASS 1: scan phdrs to find the virtual span [vmin, vmax).
+                             let mut vmin: u64 = u64::MAX;
+                             let mut vmax: u64 = 0;
+@@ -312,16 +316,36 @@ pub fn dispatch(ctx: &mut Context, mem: &mut MemoryPool) {
                                      );
                                      kernel_kit::paging::map_segment(new_cr3, stack_vaddr, stack_phys, stack_size);
                                  }
@@ -10,10 +99,9 @@ index 7157588..d9bb3e0 100644
 +                                // Context Switch setup: replace the caller's
 +                                // address space AND reset the user trap frame so
 +                                // iretq enters the new image at a clean ABI
-+                                // state (fresh stack top, zeroed GPRs). Without
-+                                // this, runtime SYS_EXEC keeps the old rsp and
-+                                // register file — the README CR3/register gap.
++                                // state (fresh stack top, zeroed GPRs).
                                  trap_frame.rip = ehdr.e_entry;
+-                                ctx.page_table_root = new_cr3; // Give the process its new virtual memory space!
 +                                trap_frame.rsp = 0xFFFFFFFF80100000;
 +                                trap_frame.rflags = 0x202;
 +                                trap_frame.cs = 0x1B;
@@ -33,7 +121,7 @@ index 7157588..d9bb3e0 100644
 +                                trap_frame.rcx = 0;
 +                                trap_frame.rbx = 0;
 +                                trap_frame.rax = 0;
-                                 ctx.page_table_root = new_cr3; // Give the process its new virtual memory space!
++                                ctx.page_table_root = new_cr3;
                                  
                                  // Clean up file descriptors
                                  for i in 0..16 {
@@ -45,10 +133,10 @@ index 7157588..d9bb3e0 100644
                                  trap_frame.rax = u64::MAX; // OOM duplicating PML4
                              }
 diff --git a/x86_64-kernel/src/main.rs b/x86_64-kernel/src/main.rs
-index 996d292..3c711e3 100644
+index 996d292..2a28f4c 100644
 --- a/x86_64-kernel/src/main.rs
 +++ b/x86_64-kernel/src/main.rs
-@@ -420,9 +420,10 @@ pub extern "C" fn syscall_interrupt_handler(rsp: u64) -> u64 {
+@@ -420,9 +420,9 @@ pub extern "C" fn syscall_interrupt_handler(rsp: u64) -> u64 {
                  };
              }
  
@@ -56,13 +144,12 @@ index 996d292..3c711e3 100644
 -            // Doing this on every syscall corrupts the TSS.esp0 that the
 -            // timer handler relies on for its trap frame placement.
 +            // Reload CR3 / TSS on a real context switch. Also reload CR3 alone
-+            // when SYS_EXEC replaced page_table_root without switching tasks —
-+            // otherwise iretq resumes the new image under the old address space.
++            // when SYS_EXEC replaced page_table_root without switching tasks.
 +            // Do NOT touch TSS on the EXEC-only path (that corrupts esp0).
              if new_rsp != rsp {
                  if let Some(next_task) = sys.scheduler.current_task() {
                      if kernel_kit::paging::Cr3::read() != next_task.page_table_root {
-@@ -430,6 +431,10 @@ pub extern "C" fn syscall_interrupt_handler(rsp: u64) -> u64 {
+@@ -430,6 +430,10 @@ pub extern "C" fn syscall_interrupt_handler(rsp: u64) -> u64 {
                      }
                      TSS.privilege_stack_table[0] = next_task.kernel_stack;
                  }
@@ -73,7 +160,7 @@ index 996d292..3c711e3 100644
              }
          }
          // NOTE: int 0x80 is a software interrupt, not PIC-sourced, so no EOI is
-@@ -471,6 +476,10 @@ pub extern "C" fn syscall_fast_handler(rsp: u64) -> u64 {
+@@ -471,6 +475,10 @@ pub extern "C" fn syscall_fast_handler(rsp: u64) -> u64 {
                      TSS.privilege_stack_table[0] = next_task.kernel_stack;
                      KERNEL_STACK_PTR = next_task.kernel_stack;
                  }
@@ -84,7 +171,7 @@ index 996d292..3c711e3 100644
              }
          }
      }
-@@ -524,6 +533,8 @@ pub extern "C" fn exception_handler(frame: *const u8, vector: u64) {
+@@ -524,6 +532,8 @@ pub extern "C" fn exception_handler(frame: *const u8, vector: u64) {
  fn inject_payloads() {
      let shell_bytes = include_bytes!("../../target/x86_64-os/release/payload");
      let daemon_bytes = include_bytes!("../../target/x86_64-os/release/daemon");
@@ -93,7 +180,7 @@ index 996d292..3c711e3 100644
      
      // Inject the payloads into the Root RamFS
      let mut fs = kernel_kit::fs::ROOT_FS.lock();
-@@ -538,6 +549,14 @@ fn inject_payloads() {
+@@ -538,6 +548,14 @@ fn inject_payloads() {
          let mut daemon_data = Vec::new();
          daemon_data.extend_from_slice(daemon_bytes);
          children.push((String::from("daemon.elf"), kernel_kit::fs::AtomNode::File(daemon_data)));
