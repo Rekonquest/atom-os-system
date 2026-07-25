@@ -63,6 +63,16 @@ pub fn yield_now() {
     unsafe { syscall0(SYS_YIELD) };
 }
 
+/// SYS_ALLOC — returns a physical frame address the current kernel cannot
+/// map into userspace. Kept for ABI completeness; programs use the `.bss`
+/// bump heap instead.
+pub fn alloc_frame() -> Option<u64> {
+    match unsafe { syscall0(SYS_ALLOC) } {
+        u64::MAX | 0 => None,
+        p => Some(p),
+    }
+}
+
 pub fn exit() -> ! {
     unsafe { syscall0(SYS_EXIT) };
     loop {}
@@ -77,6 +87,12 @@ pub fn read_char() -> Option<u8> {
 
 pub fn write_byte(b: u8) {
     unsafe { syscall1(SYS_WRITE, b as u64) };
+}
+
+/// SYS_PRINT — serial-only byte out (no VGA). Prefer [`write_byte`] for
+/// normal program output.
+pub fn print_serial(b: u8) {
+    unsafe { syscall1(SYS_PRINT, b as u64) };
 }
 
 pub fn list_dir() {
@@ -137,6 +153,28 @@ pub fn ipc_send(target_pid: u64, msg: &[u8]) -> bool {
     (unsafe { syscall2(SYS_IPC_SEND, target_pid, buf.as_ptr() as u64) }) != u64::MAX
 }
 
+/// Copy a pending IPC payload into `buf`. Returns the number of bytes
+/// copied (excluding the kernel's trailing NUL), or `None` if nothing is
+/// ready. Prefer this over holding a slice into the remapped `0x300000`
+/// page — a later RECV remaps that vaddr.
+pub fn ipc_recv_into(buf: &mut [u8]) -> Option<usize> {
+    let v = unsafe { syscall0(SYS_IPC_RECV) };
+    if v == 0 || v == u64::MAX {
+        return None;
+    }
+    let ptr = v as *const u8;
+    let mut len = 0usize;
+    unsafe {
+        while *ptr.add(len) != 0 && len < 4096 && len < buf.len() {
+            buf[len] = *ptr.add(len);
+            len += 1;
+        }
+    }
+    Some(len)
+}
+
+/// Legacy view of the kernel's IPC page at `0x300000`. Unsound if another
+/// RECV happens while the slice is held — use [`ipc_recv_into`] instead.
 pub fn ipc_recv() -> Option<&'static [u8]> {
     let v = unsafe { syscall0(SYS_IPC_RECV) };
     if v == 0 || v == u64::MAX {

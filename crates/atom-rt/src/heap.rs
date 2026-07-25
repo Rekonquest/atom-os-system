@@ -9,6 +9,10 @@ struct Arena(#[allow(dead_code)] [u8; HEAP_SIZE]);
 struct SyncArena(UnsafeCell<Arena>);
 unsafe impl Sync for SyncArena {}
 
+// `#[used]` keeps the arena in the binary even if LTO decides no live
+// alloc sites remain — the kernel loader's memsz>filesz .bss path needs
+// a real NOBITS section to exercise.
+#[used]
 static ARENA: SyncArena = SyncArena(UnsafeCell::new(Arena([0; HEAP_SIZE])));
 
 pub struct BumpAllocator {

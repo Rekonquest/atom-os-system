@@ -1,0 +1,110 @@
+diff --git a/kernel-orchestrator/src/syscall.rs b/kernel-orchestrator/src/syscall.rs
+index 7157588..d9bb3e0 100644
+--- a/kernel-orchestrator/src/syscall.rs
++++ b/kernel-orchestrator/src/syscall.rs
+@@ -312,16 +312,38 @@ pub fn dispatch(ctx: &mut Context, mem: &mut MemoryPool) {
+                                     );
+                                     kernel_kit::paging::map_segment(new_cr3, stack_vaddr, stack_phys, stack_size);
+                                 }
+-                                // Context Switch setup
++                                // Context Switch setup: replace the caller's
++                                // address space AND reset the user trap frame so
++                                // iretq enters the new image at a clean ABI
++                                // state (fresh stack top, zeroed GPRs). Without
++                                // this, runtime SYS_EXEC keeps the old rsp and
++                                // register file — the README CR3/register gap.
+                                 trap_frame.rip = ehdr.e_entry;
++                                trap_frame.rsp = 0xFFFFFFFF80100000;
++                                trap_frame.rflags = 0x202;
++                                trap_frame.cs = 0x1B;
++                                trap_frame.ss = 0x23;
++                                trap_frame.r15 = 0;
++                                trap_frame.r14 = 0;
++                                trap_frame.r13 = 0;
++                                trap_frame.r12 = 0;
++                                trap_frame.r11 = 0;
++                                trap_frame.r10 = 0;
++                                trap_frame.r9 = 0;
++                                trap_frame.r8 = 0;
++                                trap_frame.rbp = 0;
++                                trap_frame.rdi = 0;
++                                trap_frame.rsi = 0;
++                                trap_frame.rdx = 0;
++                                trap_frame.rcx = 0;
++                                trap_frame.rbx = 0;
++                                trap_frame.rax = 0;
+                                 ctx.page_table_root = new_cr3; // Give the process its new virtual memory space!
+                                 
+                                 // Clean up file descriptors
+                                 for i in 0..16 {
+                                     ctx.open_files[i] = (0, 0);
+                                 }
+-                                // Return success
+-                                trap_frame.rax = 0;
+                             } else {
+                                 trap_frame.rax = u64::MAX; // OOM duplicating PML4
+                             }
+diff --git a/x86_64-kernel/src/main.rs b/x86_64-kernel/src/main.rs
+index 996d292..3c711e3 100644
+--- a/x86_64-kernel/src/main.rs
++++ b/x86_64-kernel/src/main.rs
+@@ -420,9 +420,10 @@ pub extern "C" fn syscall_interrupt_handler(rsp: u64) -> u64 {
+                 };
+             }
+ 
+-            // Only reload CR3 / TSS if a context switch actually occurred.
+-            // Doing this on every syscall corrupts the TSS.esp0 that the
+-            // timer handler relies on for its trap frame placement.
++            // Reload CR3 / TSS on a real context switch. Also reload CR3 alone
++            // when SYS_EXEC replaced page_table_root without switching tasks —
++            // otherwise iretq resumes the new image under the old address space.
++            // Do NOT touch TSS on the EXEC-only path (that corrupts esp0).
+             if new_rsp != rsp {
+                 if let Some(next_task) = sys.scheduler.current_task() {
+                     if kernel_kit::paging::Cr3::read() != next_task.page_table_root {
+@@ -430,6 +431,10 @@ pub extern "C" fn syscall_interrupt_handler(rsp: u64) -> u64 {
+                     }
+                     TSS.privilege_stack_table[0] = next_task.kernel_stack;
+                 }
++            } else if let Some(task) = sys.scheduler.current_task() {
++                if kernel_kit::paging::Cr3::read() != task.page_table_root {
++                    kernel_kit::paging::Cr3::load(task.page_table_root);
++                }
+             }
+         }
+         // NOTE: int 0x80 is a software interrupt, not PIC-sourced, so no EOI is
+@@ -471,6 +476,10 @@ pub extern "C" fn syscall_fast_handler(rsp: u64) -> u64 {
+                     TSS.privilege_stack_table[0] = next_task.kernel_stack;
+                     KERNEL_STACK_PTR = next_task.kernel_stack;
+                 }
++            } else if let Some(task) = sys.scheduler.current_task() {
++                if kernel_kit::paging::Cr3::read() != task.page_table_root {
++                    kernel_kit::paging::Cr3::load(task.page_table_root);
++                }
+             }
+         }
+     }
+@@ -524,6 +533,8 @@ pub extern "C" fn exception_handler(frame: *const u8, vector: u64) {
+ fn inject_payloads() {
+     let shell_bytes = include_bytes!("../../target/x86_64-os/release/payload");
+     let daemon_bytes = include_bytes!("../../target/x86_64-os/release/daemon");
++    let hello_bytes = include_bytes!("../../target/x86_64-os/release/hello");
++    let fieldmon_bytes = include_bytes!("../../target/x86_64-os/release/fieldmon");
+     
+     // Inject the payloads into the Root RamFS
+     let mut fs = kernel_kit::fs::ROOT_FS.lock();
+@@ -538,6 +549,14 @@ fn inject_payloads() {
+         let mut daemon_data = Vec::new();
+         daemon_data.extend_from_slice(daemon_bytes);
+         children.push((String::from("daemon.elf"), kernel_kit::fs::AtomNode::File(daemon_data)));
++
++        let mut hello_data = Vec::new();
++        hello_data.extend_from_slice(hello_bytes);
++        children.push((String::from("hello.elf"), kernel_kit::fs::AtomNode::File(hello_data)));
++
++        let mut fieldmon_data = Vec::new();
++        fieldmon_data.extend_from_slice(fieldmon_bytes);
++        children.push((String::from("fieldmon.elf"), kernel_kit::fs::AtomNode::File(fieldmon_data)));
+     }
+     kernel_kit::fs::ROOT_FS.unlock();
+ }

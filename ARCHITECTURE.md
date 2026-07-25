@@ -10,8 +10,11 @@ source workspace) and the kernel's own `ATOM-STACK-KERNEL-DESIGN.md`.
 |---|---|
 | fmt / shell_parse / heap (pure) | 16 host unit tests pass |
 | ELF output vs loader requirements | static header/PHDR checks (`scripts\check-elf.ps1`) pass |
-| Boot: kernel init, shell banner, auto-bench, prompt, daemon heartbeat | QEMU boot on GitHub Actions, run 30032503929 (2026-07-23), gates BANNER/BENCH/DAEMON all OK — requires `patches/0001-int80-yield-use-switch-result.patch` on kernel b8540ed |
-| Interactive input, `run`/exec, hello/fieldmon from RamFS, .bss heap path | not yet exercised at runtime |
+| Boot: kernel init, shell banner, HEAP_OK, auto-bench, prompt, daemon heartbeat | QEMU boot + serial gates |
+| Interactive keyboard (`help`) | QEMU QMP `send-key` → `KEYBOARD_OK` |
+| RamFS inject of hello.elf / fieldmon.elf | `ls` → `RAMFS_OK` (requires patch 0002) |
+| `run hello.elf` / SYS_EXEC | QMP-typed `run` → `EXEC_OK` (requires patch 0002) |
+| `.bss` heap path on target | shell allocates `Vec` at boot → `HEAP_OK` |
 
 ## Layers
 
@@ -22,7 +25,7 @@ crates\atom-rt                               mechanism
   io.rs         print/read_line over sys             (cfg target_os = "none")
   fmt.rs        u64 / fixed-6 float formatting       (pure, host-tested)
   shell_parse.rs tokenizer + trim                    (pure, host-tested)
-  heap.rs       128 KiB .bss bump allocator          (host-tested; see caveat)
+  heap.rs       128 KiB .bss bump allocator          (host-tested + boot HEAP_OK)
   program!      macro: panic handler, global allocator, _start
 ```
 
@@ -85,22 +88,26 @@ Kernel-side hazards documented for future patch work:
 ## Memory model
 
 Each program links at `0xFFFFFFFF80100000`; the kernel maps an 8 KiB
-user stack just below it. `SYS_ALLOC` is unused (returns a physical
-address userspace cannot map).
+user stack just below it. `SYS_ALLOC` is unused by programs (returns a
+physical address userspace cannot map); prefer `atom_rt::sys::alloc_frame`
+only for ABI experiments.
 
-Heap caveat: the 128 KiB bump-allocator arena is host-tested, but no
-shipped program allocates on target, so the linker GCs the arena and
-the shipped ELFs contain no `.bss` segment. The kernel loader's
-zero-fill path (`memsz > filesz`) is therefore unexercised by this
-system; the first program to adopt `alloc` will be its first real user.
+Heap: the 128 KiB bump-allocator arena lives in `.bss`. The shell
+allocates a small `Vec` at boot (`HEAP_OK`) so the shipped `shell.elf`
+retains a NOBITS segment and the kernel loader's zero-fill path
+(`memsz > filesz`) is exercised. Prefer `ipc_recv_into` over the legacy
+`ipc_recv` `&'static` view of the remapped IPC page.
 
 ## Processes
 
 The kernel will spawn pid 1 = `shell.elf`, pid 2 = `daemon.elf` after
-install + rebuild. `MAX_TASKS = 16` (scheduler) and `MAX_PIDS = 16`
+install + rebuild. With patch 0002, RamFS also contains `hello.elf` and
+`fieldmon.elf` for `run`. `MAX_TASKS = 16` (scheduler) and `MAX_PIDS = 16`
 (field glue) are coincidentally equal constants with no shared source.
 `SYS_EXEC` rewrites the caller in place (same pid, same field site):
-`run` replaces the shell permanently.
+`run` replaces the shell permanently. Patch 0002 resets the user trap
+frame (`rsp` to the stack top, zeroed GPRs) and loads the new CR3 on
+the syscall return path so runtime `run` matches the initial spawn ABI.
 
 ## Known userspace limitations
 
@@ -110,8 +117,8 @@ install + rebuild. `MAX_TASKS = 16` (scheduler) and `MAX_PIDS = 16`
   interleave mid-line on the shared VGA.
 - `msg` longer than 254 bytes fails; `read_line` accepts 1024.
 - `fieldmon` hardcodes pid 1 (correct only via the exec-replace path)
-  and would terminate pid 1 on exit — it is not runnable under the
-  stock kernel anyway (RamFS injection is shell/daemon only).
+  and would terminate pid 1 on exit — runnable via `run fieldmon.elf`
+  once patch 0002 injects it into RamFS.
 - Boot-time field behavior is tick-phased, so serial output is not
   byte-reproducible across runs; `bench` prints raw rdtsc deltas.
 
@@ -120,7 +127,9 @@ install + rebuild. `MAX_TASKS = 16` (scheduler) and `MAX_PIDS = 16`
 1. Zero external crates, everywhere. `core` + `alloc` only.
 2. asm/unsafe confined to `atom-rt::sys`; programs contain none.
 3. Pure logic is host-tested; target-only code is thin wrappers.
-4. No writes to `C:\Projects\ATOM OS` (read-only source workspace) and
-   no kernel source modifications; integration is via the kernel's
-   existing `include_bytes!` paths only.
+4. No writes to `C:\Projects\ATOM OS` (read-only source workspace).
+   Kernel source is not edited in-tree; required fixes ship as
+   `patches/*.patch` and are applied by the boot-test workflow onto
+   the pinned kernel commit. Integration binaries still land via the
+   kernel's `include_bytes!` paths (`payload`/`daemon`/`hello`/`fieldmon`).
 5. No capability is claimed "working" without runtime evidence.

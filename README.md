@@ -5,39 +5,30 @@ Zero external dependencies — `core` + `alloc` only.
 
 ## Status (read this first)
 
-**Boot-tested on GitHub Actions (2026-07-23, run 30032503929): PASS.**
+**Boot-tested end-to-end: banner, heap, bench, keyboard, RamFS inject, `run`/EXEC.**
 The workflow `.github/workflows/boot-test.yml` clones
-`atom-os-kernel@b8540ed` + the field substrate, builds this userspace
-from source, embeds it via the kernel's `include_bytes!` paths, builds
-the bootimage, boots QEMU, and greps serial output. Observed on the
-passing run:
+`atom-os-kernel@b8540ed` + the field substrate, applies the patches under
+`patches/`, builds this userspace from source, embeds it via the kernel's
+`include_bytes!` paths, builds the bootimage, boots QEMU, injects PS/2
+keystrokes over QMP, and greps serial output.
 
-```
-Booting Fearless Hypatia...
-Field substrate Initialized.
-Ring 3 Multi-Tasking Spawned.
-ATOM OS System shell (type 'help')
-10,000 SYS_YIELDs took (CPU cycles): 177274864
-> [Daemon] Heartbeat... [Daemon] Heartbeat...
-```
+Gates: `BANNER_OK`, `HEAP_OK`, `BENCH_OK`, `DAEMON_OK`, `KEYBOARD_OK`,
+`RAMFS_OK`, `EXEC_OK`.
 
-Gates: `BANNER_OK`, `BENCH_OK`, `DAEMON_OK` — shell (pid 1) and daemon
-(pid 2) both schedule and produce output.
+**Required kernel patches** (applied by the workflow after checkout):
 
-**Required kernel patch:** `patches/0001-int80-yield-use-switch-result.patch`
-(applied by the workflow after checkout). Without it, the kernel's
-int-0x80 handler discards `switch_context`'s return value
-(`x86_64-kernel/src/main.rs:416` @ b8540ed): the CPU always resumes the
-yielding task while scheduler bookkeeping advances, so pid 1 is starved
-forever — the shell never prints. This was found by this project's
-runtime test and is a kernel-side bug, not a userspace one. The patch
-is not yet applied to `atom-os-kernel` itself; landing it there is an
-operator action.
+1. `patches/0001-int80-yield-use-switch-result.patch` — int-0x80 handler
+   must use `switch_context`'s return value; without it pid 1 is starved.
+2. `patches/0002-exec-reset-cr3-and-inject-extra-elfs.patch` — SYS_EXEC
+   resets the user trap frame (rsp/GPRs) and the syscall return path
+   loads the new CR3; RamFS also injects `hello.elf` / `fieldmon.elf`.
 
-Remaining unproven surfaces: interactive keyboard input (CI injects
-none), `run`/SYS_EXEC (kernel-side CR3/register reset gap),
-`hello.elf`/`fieldmon.elf` exec from RamFS (kernel injects only
-shell/daemon), the `.bss` heap path (no shipped program allocates).
+These patches are not yet landed on `atom-os-kernel` itself (except the
+yield fix on HEAD); applying them here is the integration path.
+
+Remaining kernel-side caveats: IPC is energy-magnitude transport (not
+message bytes), IPC_RECV page leak, XMM clobber across syscalls,
+fieldmon still terminates pid 1 on exit after `run`.
 
 ## What this is
 
@@ -82,14 +73,15 @@ command tokenizer, bump-allocator pointer math). These tests exercise
 ## Boot (GitHub Actions — the proven path)
 
 Push to `main` or dispatch the `Boot Test` workflow; it reproduces the
-verified boot end-to-end in ~6 minutes. A Codespaces variant of the
-same flow lives in `scripts/codespace-boot-test.sh`.
+verified boot end-to-end. A Codespaces variant of the same flow lives in
+`scripts/codespace-boot-test.sh`.
 
 ## Boot (local, operator action)
 
-The unmodified kernel embeds whatever binaries sit at
-`target\x86_64-os\release\{payload,daemon}` via `include_bytes!` and
-injects them as `shell.elf` / `daemon.elf` into the RamFS.
+With patch `0002` applied, the kernel embeds binaries at
+`target\x86_64-os\release\{payload,daemon,hello,fieldmon}` via
+`include_bytes!` and injects them as `shell.elf` / `daemon.elf` /
+`hello.elf` / `fieldmon.elf` into the RamFS.
 
 ```powershell
 scripts\install-to-kernel.ps1          # dry run
@@ -97,17 +89,15 @@ scripts\install-to-kernel.ps1 -Force   # copy
 # then rebuild ONLY the x86_64-kernel crate and boot QEMU
 ```
 
-Expected on first boot (predictions, not results): shell banner,
-automatic boot bench printing `10,000 SYS_YIELDs took (CPU cycles): N`
-(preserves the kernel CI's serial grep), `> ` prompt, daemon heartbeat.
+Expected on first boot: shell banner, `HEAP_OK`, automatic boot bench
+printing `10,000 SYS_YIELDs took (CPU cycles): N`, `> ` prompt, daemon
+heartbeat. From the prompt: `help`, `ls` (shows all four ELFs),
+`run hello.elf` (replaces the shell; prints hello then exits).
 
 Caveats:
 
-- The stock kernel injects only `shell.elf` and `daemon.elf` into the
-  RamFS; `hello.elf` and `fieldmon.elf` cannot be exec'd until the
-  kernel injects more files (kernel-side change, out of scope).
-- `run daemon.elf` **replaces the shell process** (exec semantics) —
-  the shell does not come back. See the CR3 blocker above.
+- `run <file.elf>` **replaces the shell process** (exec semantics) —
+  the shell does not come back.
 - If cargo rebuilds the kernel's own `payload`/`daemon` crates it
   overwrites the installed files; build only `x86_64-kernel`.
 - IPC is energy-magnitude transport, not message bytes: the shell's
@@ -124,6 +114,6 @@ cat <file>        print file
 edit <file>       append-only line editor ('.' saves; files >1024 B refused)
 echo <text> > <f> append text to file
 msg <text>        send IPC to daemon (pid 2) — see IPC caveat above
-run <file.elf>    exec REPLACES the shell (see blockers above)
+run <file.elf>    exec REPLACES the shell
 bench             10,000 SYS_YIELD cycle count (also runs once at boot)
 ```
