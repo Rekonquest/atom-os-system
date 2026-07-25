@@ -3,6 +3,8 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
+
 use atom_rt::shell_parse::{tokens, trim};
 use atom_rt::{io, sys};
 
@@ -131,8 +133,16 @@ fn cmd_edit(name: &[u8]) {
     io::print("saved\n");
 }
 
+fn prove_heap() {
+    let mut marker: Vec<u8> = Vec::new();
+    marker.extend_from_slice(b"HEAP_OK");
+    io::print_bytes(&marker);
+    io::print("\n");
+}
+
 fn main() -> ! {
     io::print("ATOM OS System shell (type 'help')\n");
+    prove_heap();
     cmd_bench();
     let mut line = [0u8; 1024];
     prompt();

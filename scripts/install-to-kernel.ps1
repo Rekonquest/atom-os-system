@@ -11,8 +11,10 @@ if (-not (Test-Path -LiteralPath $kernelTarget)) {
 }
 
 $map = @(
-    @{ Src = Join-Path $root 'image\shell.elf';  Dst = Join-Path $kernelTarget 'payload' },
-    @{ Src = Join-Path $root 'image\daemon.elf'; Dst = Join-Path $kernelTarget 'daemon' }
+    @{ Src = Join-Path $root 'image\shell.elf';    Dst = Join-Path $kernelTarget 'payload' },
+    @{ Src = Join-Path $root 'image\daemon.elf';   Dst = Join-Path $kernelTarget 'daemon' },
+    @{ Src = Join-Path $root 'image\hello.elf';    Dst = Join-Path $kernelTarget 'hello' },
+    @{ Src = Join-Path $root 'image\fieldmon.elf'; Dst = Join-Path $kernelTarget 'fieldmon' }
 )
 
 foreach ($m in $map) {
