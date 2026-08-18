@@ -33,13 +33,20 @@ verified correct.
    resets the user trap frame (rsp/GPRs), unshares the page-table path
    before `map_segment`, and reloads CR3 on syscall return; RamFS also
    injects `hello.elf` / `fieldmon.elf`.
+3. `patches/0003-ipc-byte-mailboxes-and-frame-recv-pages.patch` — IPC
+   delivers message bytes via per-pid mailboxes alongside the field's
+   energy transport; RECV pages come from one cached frame per pid
+   mapped at `0x00007F0000000000` (fixes the per-RECV page leak and the
+   reserved-bit / supervisor-only #PFs of the old 0x300000 slab page).
 
 These patches are not yet landed on `atom-os-kernel` itself (except the
 yield fix on HEAD); applying them here is the integration path.
 
-Remaining kernel-side caveats: IPC is energy-magnitude transport (not
-message bytes), IPC_RECV page leak, XMM clobber across syscalls,
-fieldmon still terminates pid 1 on exit after `run`.
+Remaining caveats: IPC also transports `len * 0.02` energy through the
+field (by design — bytes and energy both flow), XMM clobber across
+syscalls (unverified guess, no reproducer yet), and `run` replaces the
+shell process, so pid 1 ends when the exec'd program exits (exec
+semantics, not a crash).
 
 ## What this is
 

@@ -21,6 +21,7 @@ git clone --quiet https://github.com/Lucerna-Labs/atom-os-kernel.git
 git -C atom-os-kernel checkout --quiet "$BOOT_COMMIT"
 git -C atom-os-kernel apply "$SYSROOT/patches/0001-int80-yield-use-switch-result.patch"
 git -C atom-os-kernel apply "$SYSROOT/patches/0002-exec-reset-cr3-and-inject-extra-elfs.patch"
+git -C atom-os-kernel apply "$SYSROOT/patches/0003-ipc-byte-mailboxes-and-frame-recv-pages.patch"
 
 for p in hello daemon shell fieldmon; do
     (cd "$SYSROOT/programs/$p" && cargo +nightly build -Zjson-target-spec --release --quiet)
@@ -79,6 +80,12 @@ time.sleep(1.0)
 for k in list("ls") + ["ret"]:
     sendkey(k)
 time.sleep(1.0)
+for k in list("msg hello atom") + ["ret"]:
+    if k == " ":
+        sendkey("spc")
+    else:
+        sendkey(k)
+time.sleep(2.5)
 for k in list("run hello.elf") + ["ret"]:
     if k == " ":
         sendkey("spc")
@@ -104,5 +111,6 @@ if grep -q "10,000 SYS_YIELDs took" qemu.log; then echo "BENCH_OK"; else echo "B
 if grep -q "Daemon" qemu.log; then echo "DAEMON_OK"; else echo "DAEMON_MISSING (non-fatal)"; fi
 if grep -q "commands:" qemu.log; then echo "KEYBOARD_OK"; else echo "KEYBOARD_MISSING"; fail=1; fi
 if grep -q "hello.elf" qemu.log && grep -q "fieldmon.elf" qemu.log; then echo "RAMFS_OK"; else echo "RAMFS_MISSING"; fail=1; fi
-if grep -q "hello from ATOM OS System" qemu.log; then echo "EXEC_OK"; else echo "EXEC_MISSING (non-fatal — kernel runtime EXEC gap)"; fi
+if grep -q "hello from ATOM OS System" qemu.log; then echo "EXEC_OK"; else echo "EXEC_MISSING"; fail=1; fi
+if grep -q "Received IPC: hello atom" qemu.log; then echo "IPC_OK"; else echo "IPC_MISSING (non-fatal — daemon RECV-cycle timing)"; fi
 [ "$fail" = 0 ] && echo "RUNTIME_SMOKE_PASS" || { echo "RUNTIME_SMOKE_FAIL"; exit 1; }

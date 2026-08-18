@@ -15,6 +15,8 @@ source workspace) and the kernel's own `ATOM-STACK-KERNEL-DESIGN.md`.
 | RamFS inject of hello.elf / fieldmon.elf | `ls` → `RAMFS_OK` (requires patch 0002) |
 | `run hello.elf` / SYS_EXEC | QEMU boot + serial gate `EXEC_OK`: execs, prints, exits; daemon survives (2026-08-18). Prior #GP was userspace `_start` stack misalignment, fixed in atom-rt; patch 0002 verified correct |
 | `.bss` heap path on target | shell allocates `Vec` at boot → `HEAP_OK` |
+| IPC byte delivery (`msg hello atom`) | QEMU QMP keys → `[Daemon] Received IPC: hello atom` (requires patch 0003; 2026-08-18) |
+| `run fieldmon.elf` field observation | 10 observe rounds print, clean exit, daemon survives (2026-08-18) |
 
 ## Layers
 
@@ -56,29 +58,35 @@ educated guess pending disassembly).
 | 13 | EXEC | rdi=NUL-terminated path | replaces caller; u64::MAX on failure |
 | 14 | PRINT | rdi=byte | serial only, 0 |
 | 15 | IPC_SEND | rdi=target pid, rsi=NUL-terminated msg | 0 or u64::MAX |
-| 16 | IPC_RECV | — | 0 (nothing) or vaddr 0x300000 |
+| 16 | IPC_RECV | — | 0 (nothing) or RECV-page vaddr (0x00007F0000000000 since patch 0003) |
 | 17 | FIELD_STIMULATE | rdi=pid, rsi=f32 magnitude bits | 0 or u64::MAX |
 | 18 | FIELD_EVOLVE | rdi=moments | new field age |
 | 19 | FIELD_OBSERVE | rdi=pid | trace-peak delta, f32 bits |
 | 20 | FIELD_MEASUREMENTS | — | introduced energy, f64 bits |
 
-### IPC is not message passing
+### IPC is dual transport: bytes plus field energy
 
-The kernel's field-rewired IPC (15/16) discards the message bytes and
-transports only `len * 0.02` energy. RECV maps a page at `0x300000`
-containing `delta as u64` as ASCII — the fractional part is truncated,
-so small messages render as `0`. The daemon printing
-`[Daemon] Received IPC: 0` for every message is the expected behavior
-of the current kernel, not a userspace bug.
+Since patch 0003, SYS_IPC_SEND delivers the message bytes to a per-pid
+single-slot mailbox (latest wins) AND injects `len * 0.02` energy into
+the field (the energy transport is unchanged). SYS_IPC_RECV returns the
+mailbox bytes when present; otherwise it falls back to the field
+radiation path, which encodes the magnitude `delta as u64` as ASCII —
+the fractional part is truncated, so energy-only signals render as `0`.
+The RECV payload lands in a per-pid cached frame mapped at
+`0x00007F0000000000` (one frame per pid, reused — no leak). The
+historical `0x300000` address is retired: its PML4[0] chain comes from
+the bootloader and is supervisor-only (x86-64 requires U/S at every
+level for ring-3 access), and the old slab page's physical address came
+from `virt_to_phys` outside the phys-offset window — together they
+produced reserved-bit and user-access #PFs the first time RECV returned
+a page.
 
 Kernel-side hazards documented for future patch work:
 
-- Every ready RECV leaks a 4 KiB kernel-heap page (never freed).
-- `atom_rt::sys::ipc_recv` returns `&'static [u8]` over the `0x300000`
-  mapping; a later RECV remaps the same vaddr to a new page, so holding
-  a slice across another RECV is unsound. Current daemon drops the
-  slice before its next recv — do not change that without fixing the
-  API.
+- `atom_rt::sys::ipc_recv` returns `&'static [u8]` over the RECV page
+  mapping; a later RECV overwrites that page in place, so holding a
+  slice across another RECV is unsound. Current daemon drops the slice
+  before its next recv — do not change that without fixing the API.
 - FIELD_OBSERVE (19) shares its baseline with IPC_RECV (16): observing
   a pid consumes that pid's pending IPC delta. fieldmon observes only
   its own pid for this reason.

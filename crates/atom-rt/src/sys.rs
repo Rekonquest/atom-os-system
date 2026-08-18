@@ -155,8 +155,8 @@ pub fn ipc_send(target_pid: u64, msg: &[u8]) -> bool {
 
 /// Copy a pending IPC payload into `buf`. Returns the number of bytes
 /// copied (excluding the kernel's trailing NUL), or `None` if nothing is
-/// ready. Prefer this over holding a slice into the remapped `0x300000`
-/// page — a later RECV remaps that vaddr.
+/// ready. Prefer this over holding a slice into the RECV page — a later
+/// RECV overwrites that page in place.
 pub fn ipc_recv_into(buf: &mut [u8]) -> Option<usize> {
     let v = unsafe { syscall0(SYS_IPC_RECV) };
     if v == 0 || v == u64::MAX {
@@ -173,8 +173,9 @@ pub fn ipc_recv_into(buf: &mut [u8]) -> Option<usize> {
     Some(len)
 }
 
-/// Legacy view of the kernel's IPC page at `0x300000`. Unsound if another
-/// RECV happens while the slice is held — use [`ipc_recv_into`] instead.
+/// Legacy zero-copy view of the kernel's RECV page (vaddr returned by
+/// RECV). Unsound if another RECV happens while the slice is held — use
+/// [`ipc_recv_into`] instead.
 pub fn ipc_recv() -> Option<&'static [u8]> {
     let v = unsafe { syscall0(SYS_IPC_RECV) };
     if v == 0 || v == u64::MAX {

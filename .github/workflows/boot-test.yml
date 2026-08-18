@@ -46,6 +46,7 @@ jobs:
           K="$GITHUB_WORKSPACE/../atom-os-kernel"
           git -C "$K" apply "$GITHUB_WORKSPACE/patches/0001-int80-yield-use-switch-result.patch"
           git -C "$K" apply "$GITHUB_WORKSPACE/patches/0002-exec-reset-cr3-and-inject-extra-elfs.patch"
+          git -C "$K" apply "$GITHUB_WORKSPACE/patches/0003-ipc-byte-mailboxes-and-frame-recv-pages.patch"
 
       - name: Build userspace programs
         run: |
@@ -120,6 +121,14 @@ jobs:
               sendkey(k)
           time.sleep(1.0)
 
+          # Prove IPC byte transport: the daemon must print the message text.
+          for k in list("msg hello atom") + ["ret"]:
+              if k == " ":
+                  sendkey("spc")
+              else:
+                  sendkey(k)
+          time.sleep(2.5)
+
           # Prove SYS_EXEC: run hello.elf (replaces shell).
           for k in list("run hello.elf") + ["ret"]:
               # space is qcode "spc", '.' is "dot"
@@ -174,10 +183,13 @@ jobs:
           if grep -q "hello from ATOM OS System" qemu.log; then
             echo "EXEC_OK"
           else
-            # Runtime SYS_EXEC still #GPs in the stock kernel before the
-            # handler runs (shallow page-table sharing). Patch 0002 resets
-            # the trap frame / CR3 / unshares paths; landing a full fix is
-            # still a kernel-side follow-up. Non-fatal for this workflow.
-            echo "EXEC_MISSING (non-fatal — kernel runtime EXEC gap)"
+            echo "EXEC_MISSING"; fail=1
+          fi
+          if grep -q "Received IPC: hello atom" qemu.log; then
+            echo "IPC_OK"
+          else
+            # Byte delivery depends on the daemon's RECV cycle (500k yields)
+            # landing inside the window; TCG runners can be too slow for it.
+            echo "IPC_MISSING (non-fatal — daemon RECV-cycle timing)"
           fi
           exit $fail
