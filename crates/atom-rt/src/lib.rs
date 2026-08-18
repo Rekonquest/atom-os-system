@@ -10,6 +10,8 @@ pub mod shell_parse;
 pub mod io;
 #[cfg(target_os = "none")]
 pub mod sys;
+#[cfg(target_os = "none")]
+pub mod xmm;
 
 #[macro_export]
 macro_rules! program {

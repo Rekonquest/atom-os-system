@@ -17,6 +17,7 @@ source workspace) and the kernel's own `ATOM-STACK-KERNEL-DESIGN.md`.
 | `.bss` heap path on target | shell allocates `Vec` at boot → `HEAP_OK` |
 | IPC byte delivery (`msg hello atom`) | QEMU QMP keys → `[Daemon] Received IPC: hello atom` (requires patch 0003; 2026-08-18) |
 | `run fieldmon.elf` field observation | 10 observe rounds print, clean exit, daemon survives (2026-08-18) |
+| XMM liveness across syscalls/preemption | `xtest` probe: XMM_OK baseline/syscall/preempt×3 with patch 0004; same probe caught clobbers without it (2026-08-18) |
 
 ## Layers
 
@@ -36,10 +37,16 @@ crates\atom-rt                               mechanism
 `int 0x80`, `rax` = number, args `rdi`, `rsi`, return in `rax`.
 Register contract: the kernel's int-0x80 wrapper pushes/pops all 15
 GPRs and iretq restores RFLAGS, so `options(nostack, preserves_flags)`
-matches the proven payload pattern. XMM registers are NOT saved by the
-kernel trap frame while the dispatch path does f32 math — userspace
-floats held live across a syscall may be clobbered (kernel-side gap,
-educated guess pending disassembly).
+matches the proven payload pattern. XMM registers ARE preserved across
+kernel entry since patch 0004: the timer/syscall/keyboard wrappers save
+the interrupted task's 16 XMM regs below the trap frame and restore the
+resumed task's state before iretq (movdqu chains — kernel stacks are
+align-1 bump allocations, so FXSAVE's 16-byte alignment cannot be
+assumed; the kernel never touches MXCSR/AVX, so XMM is the full
+user-visible SSE state). Verified by the shell's `xtest` probe: before
+the patch it caught kernel field-evolve working values leaking into
+xmm0 on both the syscall and preemption paths; after, baseline,
+100k-yield syscall, and ~2 s preempt rounds all stay clean.
 
 | # | Name | Args | Returns |
 |---|------|------|---------|

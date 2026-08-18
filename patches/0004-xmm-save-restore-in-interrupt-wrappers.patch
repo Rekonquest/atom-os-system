@@ -1,0 +1,163 @@
+diff --git a/x86_64-kernel/src/main.rs b/x86_64-kernel/src/main.rs
+--- a/x86_64-kernel/src/main.rs
++++ b/x86_64-kernel/src/main.rs
+@@ -78,12 +78,51 @@
+     push r14
+     push r15
+ 
+-    // Pass the current stack pointer (rsp) as the first argument (rdi) to the Rust handler
+-    mov rdi, rsp
++    // Save user XMM state below the trap frame (movdqu: no alignment
++    // requirement — kernel stacks are bump-allocated at align 1). The
++    // block stays reserved at [frame-512, frame) across the handler;
++    // the kernel never touches MXCSR or AVX state, so 16 xmm regs are
++    // the full user-visible SSE state (patch 0004).
++    sub rsp, 512
++    movdqu [rsp+0], xmm0
++    movdqu [rsp+16], xmm1
++    movdqu [rsp+32], xmm2
++    movdqu [rsp+48], xmm3
++    movdqu [rsp+64], xmm4
++    movdqu [rsp+80], xmm5
++    movdqu [rsp+96], xmm6
++    movdqu [rsp+112], xmm7
++    movdqu [rsp+128], xmm8
++    movdqu [rsp+144], xmm9
++    movdqu [rsp+160], xmm10
++    movdqu [rsp+176], xmm11
++    movdqu [rsp+192], xmm12
++    movdqu [rsp+208], xmm13
++    movdqu [rsp+224], xmm14
++    movdqu [rsp+240], xmm15
++    // Pass the TrapFrame address (frame base, above the XMM block) to the handler
++    lea rdi, [rsp + 512]
+     call timer_interrupt_handler
+ 
+-    // The Rust handler returns the new stack pointer in rax. Switch stacks!
++    // The Rust handler returns the resumed task's frame base in rax.
++    // Restore the resumed task's XMM state from below its frame.
+     mov rsp, rax
++    movdqu xmm0, [rsp-512]
++    movdqu xmm1, [rsp-496]
++    movdqu xmm2, [rsp-480]
++    movdqu xmm3, [rsp-464]
++    movdqu xmm4, [rsp-448]
++    movdqu xmm5, [rsp-432]
++    movdqu xmm6, [rsp-416]
++    movdqu xmm7, [rsp-400]
++    movdqu xmm8, [rsp-384]
++    movdqu xmm9, [rsp-368]
++    movdqu xmm10, [rsp-352]
++    movdqu xmm11, [rsp-336]
++    movdqu xmm12, [rsp-320]
++    movdqu xmm13, [rsp-304]
++    movdqu xmm14, [rsp-288]
++    movdqu xmm15, [rsp-272]
+ 
+     // Pop all general purpose registers from the new task's TrapFrame
+     pop r15
+@@ -126,11 +165,50 @@
+     push r14
+     push r15
+ 
+-    mov rdi, rsp
++    // Save user XMM state below the trap frame (movdqu: no alignment
++    // requirement — kernel stacks are bump-allocated at align 1). The
++    // block stays reserved at [frame-512, frame) across the handler;
++    // the kernel never touches MXCSR or AVX state, so 16 xmm regs are
++    // the full user-visible SSE state (patch 0004).
++    sub rsp, 512
++    movdqu [rsp+0], xmm0
++    movdqu [rsp+16], xmm1
++    movdqu [rsp+32], xmm2
++    movdqu [rsp+48], xmm3
++    movdqu [rsp+64], xmm4
++    movdqu [rsp+80], xmm5
++    movdqu [rsp+96], xmm6
++    movdqu [rsp+112], xmm7
++    movdqu [rsp+128], xmm8
++    movdqu [rsp+144], xmm9
++    movdqu [rsp+160], xmm10
++    movdqu [rsp+176], xmm11
++    movdqu [rsp+192], xmm12
++    movdqu [rsp+208], xmm13
++    movdqu [rsp+224], xmm14
++    movdqu [rsp+240], xmm15
++    lea rdi, [rsp + 512]
+     call syscall_interrupt_handler
+ 
+-    // The handler doesn't change the stack pointer for a syscall, it just returns it
++    // Same rsp back for plain syscalls; a switched frame for YIELD/EXIT.
++    // Restore the resumed task's XMM state from below its frame.
+     mov rsp, rax
++    movdqu xmm0, [rsp-512]
++    movdqu xmm1, [rsp-496]
++    movdqu xmm2, [rsp-480]
++    movdqu xmm3, [rsp-464]
++    movdqu xmm4, [rsp-448]
++    movdqu xmm5, [rsp-432]
++    movdqu xmm6, [rsp-416]
++    movdqu xmm7, [rsp-400]
++    movdqu xmm8, [rsp-384]
++    movdqu xmm9, [rsp-368]
++    movdqu xmm10, [rsp-352]
++    movdqu xmm11, [rsp-336]
++    movdqu xmm12, [rsp-320]
++    movdqu xmm13, [rsp-304]
++    movdqu xmm14, [rsp-288]
++    movdqu xmm15, [rsp-272]
+ 
+     pop r15
+     pop r14
+@@ -174,10 +252,50 @@
+     push r14
+     push r15
+ 
+-    mov rdi, rsp
++    // Save user XMM state below the trap frame (movdqu: no alignment
++    // requirement — kernel stacks are bump-allocated at align 1). The
++    // block stays reserved at [frame-512, frame) across the handler;
++    // the kernel never touches MXCSR or AVX state, so 16 xmm regs are
++    // the full user-visible SSE state (patch 0004).
++    sub rsp, 512
++    movdqu [rsp+0], xmm0
++    movdqu [rsp+16], xmm1
++    movdqu [rsp+32], xmm2
++    movdqu [rsp+48], xmm3
++    movdqu [rsp+64], xmm4
++    movdqu [rsp+80], xmm5
++    movdqu [rsp+96], xmm6
++    movdqu [rsp+112], xmm7
++    movdqu [rsp+128], xmm8
++    movdqu [rsp+144], xmm9
++    movdqu [rsp+160], xmm10
++    movdqu [rsp+176], xmm11
++    movdqu [rsp+192], xmm12
++    movdqu [rsp+208], xmm13
++    movdqu [rsp+224], xmm14
++    movdqu [rsp+240], xmm15
++    lea rdi, [rsp + 512]
+     call keyboard_interrupt_handler
+ 
++    // Keyboard handler never switches tasks; returns the same frame.
++    // Restore the resumed task's XMM state from below its frame.
+     mov rsp, rax
++    movdqu xmm0, [rsp-512]
++    movdqu xmm1, [rsp-496]
++    movdqu xmm2, [rsp-480]
++    movdqu xmm3, [rsp-464]
++    movdqu xmm4, [rsp-448]
++    movdqu xmm5, [rsp-432]
++    movdqu xmm6, [rsp-416]
++    movdqu xmm7, [rsp-400]
++    movdqu xmm8, [rsp-384]
++    movdqu xmm9, [rsp-368]
++    movdqu xmm10, [rsp-352]
++    movdqu xmm11, [rsp-336]
++    movdqu xmm12, [rsp-320]
++    movdqu xmm13, [rsp-304]
++    movdqu xmm14, [rsp-288]
++    movdqu xmm15, [rsp-272]
+ 
+     pop r15
+     pop r14

@@ -38,13 +38,18 @@ verified correct.
    energy transport; RECV pages come from one cached frame per pid
    mapped at `0x00007F0000000000` (fixes the per-RECV page leak and the
    reserved-bit / supervisor-only #PFs of the old 0x300000 slab page).
+4. `patches/0004-xmm-save-restore-in-interrupt-wrappers.patch` — the
+   timer/syscall/keyboard wrappers save the interrupted task's 16 XMM
+   registers below the trap frame (movdqu chain — kernel stacks are
+   align-1, so FXSAVE cannot be used) and restore the resumed task's
+   state before iretq. The kernel never touches MXCSR/AVX, so the XMM
+   regs are the full user-visible SSE state.
 
 These patches are not yet landed on `atom-os-kernel` itself (except the
 yield fix on HEAD); applying them here is the integration path.
 
 Remaining caveats: IPC also transports `len * 0.02` energy through the
-field (by design — bytes and energy both flow), XMM clobber across
-syscalls (unverified guess, no reproducer yet), and `run` replaces the
+field (by design — bytes and energy both flow), and `run` replaces the
 shell process, so pid 1 ends when the exec'd program exits (exec
 semantics, not a crash).
 

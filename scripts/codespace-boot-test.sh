@@ -22,6 +22,7 @@ git -C atom-os-kernel checkout --quiet "$BOOT_COMMIT"
 git -C atom-os-kernel apply "$SYSROOT/patches/0001-int80-yield-use-switch-result.patch"
 git -C atom-os-kernel apply "$SYSROOT/patches/0002-exec-reset-cr3-and-inject-extra-elfs.patch"
 git -C atom-os-kernel apply "$SYSROOT/patches/0003-ipc-byte-mailboxes-and-frame-recv-pages.patch"
+git -C atom-os-kernel apply "$SYSROOT/patches/0004-xmm-save-restore-in-interrupt-wrappers.patch"
 
 for p in hello daemon shell fieldmon; do
     (cd "$SYSROOT/programs/$p" && cargo +nightly build -Zjson-target-spec --release --quiet)
