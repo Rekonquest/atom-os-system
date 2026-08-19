@@ -24,6 +24,7 @@ git -C atom-os-kernel apply "$SYSROOT/patches/0002-exec-reset-cr3-and-inject-ext
 git -C atom-os-kernel apply "$SYSROOT/patches/0003-ipc-byte-mailboxes-and-frame-recv-pages.patch"
 git -C atom-os-kernel apply "$SYSROOT/patches/0004-xmm-save-restore-in-interrupt-wrappers.patch"
 git -C atom-os-kernel apply "$SYSROOT/patches/0005-sys-spawn-runtime-process-creation.patch"
+git -C atom-os-kernel apply "$SYSROOT/patches/0006-reap-spawned-task-resources-on-exit.patch"
 
 for p in hello daemon shell fieldmon; do
     (cd "$SYSROOT/programs/$p" && cargo +nightly build -Zjson-target-spec --release --quiet)
@@ -96,6 +97,17 @@ for k in list("spawn hello.elf") + ["ret"]:
     else:
         sendkey(k)
 time.sleep(2.5)
+# Second spawn: the first hello has exited, so its slot is Terminated and
+# the scheduler reaps it (patch 0006) before reuse — the REAP/LEAK gates
+# below read the diagnostics this prints on serial.
+for k in list("spawn hello.elf") + ["ret"]:
+    if k == " ":
+        sendkey("spc")
+    elif k == ".":
+        sendkey("dot")
+    else:
+        sendkey(k)
+time.sleep(2.5)
 for k in list("run hello.elf") + ["ret"]:
     if k == " ":
         sendkey("spc")
@@ -124,4 +136,15 @@ if grep -q "hello.elf" qemu.log && grep -q "fieldmon.elf" qemu.log; then echo "R
 if grep -q "hello from ATOM OS System" qemu.log; then echo "EXEC_OK"; else echo "EXEC_MISSING"; fail=1; fi
 if grep -q "Received IPC: hello atom" qemu.log; then echo "IPC_OK"; else echo "IPC_MISSING (non-fatal — daemon RECV-cycle timing)"; fi
 if grep -q "spawned pid" qemu.log && [ "$(grep -c "hello from ATOM OS System" qemu.log)" -ge 2 ]; then echo "SPAWN_OK"; else echo "SPAWN_MISSING"; fail=1; fi
+if grep -q "REAP pid=" qemu.log; then echo "REAP_OK"; else echo "REAP_MISSING"; fail=1; fi
+freed=$(grep -o "REAP pid=[0-9]* freed=[0-9]*" qemu.log | head -1 | sed "s/.*freed=//")
+if [ -n "$freed" ] && [ "$freed" -ge 8 ]; then echo "REAP_FRAMES_OK (freed=$freed)"; else echo "REAP_FRAMES_LOW (freed=${freed:-none})"; fail=1; fi
+# Exact leak-closed invariant: REAP prints the free count right after
+# returning the dead task's frames; the LAST SPAWN line is the spawn whose
+# slot reuse performed that reap, its free_before captured just before its
+# own allocations — so equality proves the reap returned precisely what a
+# spawn consumes.
+before=$(grep -o "SPAWN pid=[0-9]* free_before=[0-9]*" qemu.log | tail -1 | sed "s/.*free_before=//")
+after=$(grep -o "REAP pid=[0-9]* freed=[0-9]* free=[0-9]*" qemu.log | tail -1 | sed "s/.*free=//")
+if [ -n "$before" ] && [ "$after" = "$before" ]; then echo "LEAK_CLOSED (free_before=$before free_after_reap=$after)"; else echo "LEAK_OPEN (free_before=${before:-none} free_after_reap=${after:-none})"; fail=1; fi
 [ "$fail" = 0 ] && echo "RUNTIME_SMOKE_PASS" || { echo "RUNTIME_SMOKE_FAIL"; exit 1; }

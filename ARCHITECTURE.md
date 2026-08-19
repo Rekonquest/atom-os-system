@@ -19,6 +19,7 @@ source workspace) and the kernel's own `ATOM-STACK-KERNEL-DESIGN.md`.
 | `run fieldmon.elf` field observation | 10 observe rounds print, clean exit, daemon survives (2026-08-18) |
 | XMM liveness across syscalls/preemption | `xtest` probe: XMM_OK baseline/syscall/preempt×3 with patch 0004; same probe caught clobbers without it (2026-08-18) |
 | `spawn hello.elf` / SYS_SPAWN | `spawned pid 3`, hello prints, shell prompt returns; pid/slot reclaimed on second spawn; fieldmon spawns, runs 10 rounds, exits, shell survives (patch 0005; 2026-08-18) |
+| Reap of exited tasks' resources | Gates `REAP_OK` / `REAP_FRAMES_OK` / `LEAK_CLOSED`: a second spawn reaps the dead task's slot — 8 frames return (private page tables, kernel stack, image span, user stack) and the allocator free-count returns exactly to the spawning spawn's pre-allocation value; fieldmon reaps identically (patch 0006; 2026-08-19) |
 
 ## Layers
 
@@ -127,15 +128,33 @@ frame (`rsp` to the stack top, zeroed GPRs) and loads the new CR3 on
 the syscall return path so runtime `run` matches the initial spawn ABI.
 
 Since patch 0005, `SYS_SPAWN` (21) loads a RamFS ELF as a brand-new
-task — own pid, 4 KiB kernel stack, fresh trap frame, private address
-space built from the active CR3 — and hands it to the scheduler; the
-caller keeps running (`spawn` in the shell). EXEC and SPAWN share the
-`load_user_image` loader. The scheduler reclaims Terminated task slots
-and `alloc_pid` hands out the lowest free pid 1..15, so short-lived
-spawns do not exhaust the table; a reused pid inherits its old
-field-site history (accepted, documented here). The spawned program's
-kernel stack and image frames are not freed on exit (documented leak,
-bounded by use).
+task — own pid, frame-backed 4 KiB kernel stack, fresh trap frame,
+private address space built from the active CR3 — and hands it to the
+scheduler; the caller keeps running (`spawn` in the shell). EXEC and
+SPAWN share the `load_user_image` loader. The scheduler reclaims
+Terminated task slots and `alloc_pid` hands out the lowest free pid
+1..15, so short-lived spawns do not exhaust the table; a reused pid
+inherits its old field-site history (accepted, documented here).
+
+Since patch 0006, slot reclaim also reaps the dead task's resources.
+`Context` records everything `load_user_image` allocates (parent CR3,
+image span, user-stack run, kernel-stack frame), and when the scheduler
+overwrites a Terminated slot, `reap_context` returns the frames to the
+allocator: the kernel-stack frame, the image and user-stack runs, and
+every PRIVATE page-table frame, recovered by a diff-walk against the
+parent CR3 (subtrees whose parent slot points at the same frame are
+shared and untouched; leaf data frames are never freed by the walk;
+per-pid IPC RECV frames stay globally cached). Reap-at-reuse is the
+safe point: another task has run since the termination, so the dead
+CR3 is not loaded and nothing references the dead stack. Spawned
+kernel stacks come from the frame allocator instead of the kernel heap
+because the heap cannot free individual blocks. Address spaces
+REPLACED by `run`/EXEC still leak — their roots are never freed while
+other tasks may hold them as diff-walk baselines; that is the next
+candidate. Diagnostics: every successful spawn prints
+`SPAWN pid=N free_before=F` on serial and every reap prints
+`REAP pid=N freed=K free=F`; CI asserts `freed ≥ 8` and exact
+free-count equality across the reap window.
 
 ## Known userspace limitations
 
@@ -144,9 +163,10 @@ bounded by use).
 - Shell echoes per keystroke and heartbeat text from the daemon can
   interleave mid-line on the shared VGA.
 - `msg` longer than 254 bytes fails; `read_line` accepts 1024.
-- `fieldmon` hardcodes pid 1 (correct only via the exec-replace path)
-  and would terminate pid 1 on exit — runnable via `run fieldmon.elf`
-  once patch 0002 injects it into RamFS.
+- `fieldmon` via `run` replaces the shell (exec semantics); prefer
+  `spawn fieldmon.elf` — it runs its 10 observation rounds and exits
+  with the shell alive, and its slot is reaped on the next spawn
+  (patches 0005/0006, verified 2026-08-18/19).
 - Boot-time field behavior is tick-phased, so serial output is not
   byte-reproducible across runs; `bench` prints raw rdtsc deltas.
 

@@ -1,0 +1,499 @@
+diff --git a/kernel-kit/src/context.rs b/kernel-kit/src/context.rs
+index f6cc38f..4dbbc9f 100644
+--- a/kernel-kit/src/context.rs
++++ b/kernel-kit/src/context.rs
+@@ -20,6 +20,21 @@ pub struct Context {
+     // This ensures the complete task state (rip, rflags, all GPRs) is preserved
+     // across context switches, even if the stack is modified or overwritten.
+     pub saved_state: Option<super::trap::TrapFrame>,
++    // Resource bookkeeping for reaping on exit (patch 0006). All zero for
++    // boot-spawned tasks whose resources are never reclaimed (heap kernel
++    // stacks, original address spaces); reap_context skips zero fields.
++    /// CR3 that page_table_root was duplicated from. 0 = page_table_root is
++    /// not a duplicate (never free its tables).
++    pub parent_pml4: u64,
++    /// Contiguous physical run holding the loaded image data.
++    pub image_span_phys: u64,
++    pub image_span_frames: usize,
++    /// Contiguous physical run holding the user stack.
++    pub user_stack_phys: u64,
++    pub user_stack_frames: usize,
++    /// Physical frame backing the kernel stack (frame-allocated stacks only).
++    /// 0 = kernel stack lives in the kernel heap and cannot be freed.
++    pub kernel_stack_frame: u64,
+ }
+ 
+ impl Context {
+@@ -32,6 +47,12 @@ impl Context {
+             page_table_root,
+             open_files: [(0, 0); 16],
+             saved_state: None,
++            parent_pml4: 0,
++            image_span_phys: 0,
++            image_span_frames: 0,
++            user_stack_phys: 0,
++            user_stack_frames: 0,
++            kernel_stack_frame: 0,
+         }
+     }
+ 
+diff --git a/kernel-kit/src/memory.rs b/kernel-kit/src/memory.rs
+index 6cc1265..3c05ce5 100644
+--- a/kernel-kit/src/memory.rs
++++ b/kernel-kit/src/memory.rs
+@@ -346,6 +346,19 @@ impl FrameAllocator {
+         None
+     }
+ 
++    /// Number of currently free frames in the pool. Diagnostic only —
++    /// used by the reap gate to prove spawned resources actually return
++    /// to the pool (patch 0006).
++    pub fn free_count(&self) -> usize {
++        let mut n = 0;
++        for i in 0..self.count {
++            if self.frames[i] {
++                n += 1;
++            }
++        }
++        n
++    }
++
+     /// Free a frame previously returned by `alloc_frame`.
+     pub fn free_frame(&mut self, phys: u64) {
+         if self.count == 0 {
+diff --git a/kernel-kit/src/paging.rs b/kernel-kit/src/paging.rs
+index 22c7209..7761837 100644
+--- a/kernel-kit/src/paging.rs
++++ b/kernel-kit/src/paging.rs
+@@ -300,3 +300,95 @@ pub fn map_segment(pml4_phys: u64, vaddr: u64, paddr: u64, size: usize) {
+         }
+     }
+ }
++
++/// Release every page-table frame that `child` owns privately relative to
++/// `parent` — the CR3 that `child` was duplicated from (patch 0006).
++///
++/// `duplicate_pml4` is a shallow copy and `unshare_page_path` copies table
++/// contents, so a private subtree can still contain entries pointing at
++/// tables shared with the parent. The walk therefore diffs each level
++/// against the parent's same-slot entry: a frame whose parent slot points
++/// at the SAME frame is shared and left alone; a frame whose parent slot
++/// differs (or is absent) is private and released recursively.
++///
++/// Only page-table frames are released. Leaf data frames (image spans, user
++/// stacks, cached IPC RECV frames) are never touched here — their owners
++/// track and free them separately. Huge-page entries (bit 7) are skipped:
++/// they are data mappings copied from the parent, never privately allocated.
++///
++/// Contract: `child` must not be any running task's active CR3, and
++/// `parent` must still be valid memory (a live task's root or a root that
++/// is leaked-but-never-freed). Returns the number of frames released.
++pub fn free_private_tables(child_pml4: u64, parent_pml4: u64) -> usize {
++    if child_pml4 == 0 || parent_pml4 == 0 || child_pml4 == parent_pml4 {
++        return 0;
++    }
++    let mut freed = 0;
++    unsafe {
++        let child = &*(phys_to_virt(child_pml4) as *const PageTable);
++        let parent = &*(phys_to_virt(parent_pml4) as *const PageTable);
++        for i in 0..512 {
++            let c = child.entries[i].0;
++            if (c & 1) == 0 { continue; }
++            if (c & (1 << 7)) != 0 { continue; } // reserved at PML4; skip defensively
++            let c_addr = c & 0x000FFFFFFFFFF000;
++            let p = parent.entries[i].0;
++            if (p & 1) != 0 && (p & 0x000FFFFFFFFFF000) == c_addr {
++                continue; // shared subtree
++            }
++            let parent_next = if (p & 1) != 0 {
++                Some(p & 0x000FFFFFFFFFF000)
++            } else {
++                None
++            };
++            // The PML4 entry targets a PDPT: level 3 (PDPT->PD->PT below).
++            freed += free_table_subtree(c_addr, parent_next, 3);
++            free_one_frame(c_addr);
++            freed += 1;
++        }
++    }
++    free_one_frame(child_pml4);
++    freed + 1
++}
++
++/// Release the private part of one page-table frame's subtree. `level` is
++/// the level of `tbl_phys` itself: 3 = PDPT, 2 = PD, 1 = PT. At level 1 the
++/// entries point at 4 KiB data frames, which are never released here.
++/// Returns the number of frames released below `tbl_phys` (not counting
++/// `tbl_phys` itself).
++unsafe fn free_table_subtree(tbl_phys: u64, parent_tbl: Option<u64>, level: usize) -> usize {
++    let mut freed = 0;
++    let tbl = &*(phys_to_virt(tbl_phys) as *const PageTable);
++    for i in 0..512 {
++        let e = tbl.entries[i].0;
++        if (e & 1) == 0 { continue; }
++        if (e & (1 << 7)) != 0 { continue; } // huge leaf: data, copied from parent
++        let e_addr = e & 0x000FFFFFFFFFF000;
++        let mut pe: u64 = 0;
++        if let Some(pt_phys) = parent_tbl {
++            let pt = &*(phys_to_virt(pt_phys) as *const PageTable);
++            pe = pt.entries[i].0;
++            if (pe & 1) != 0 && (pe & 0x000FFFFFFFFFF000) == e_addr {
++                continue; // shared at this level too
++            }
++        }
++        if level > 1 {
++            let parent_next = if (pe & 1) != 0 {
++                Some(pe & 0x000FFFFFFFFFF000)
++            } else {
++                None
++            };
++            freed += free_table_subtree(e_addr, parent_next, level - 1);
++            free_one_frame(e_addr);
++            freed += 1;
++        }
++        // level == 1: e_addr is a leaf data frame — tracked elsewhere.
++    }
++    freed
++}
++
++fn free_one_frame(phys: u64) {
++    let (fa, sif) = crate::memory::FRAME_ALLOCATOR.lock();
++    fa.free_frame(phys);
++    crate::memory::FRAME_ALLOCATOR.unlock(sif);
++}
+diff --git a/kernel-orchestrator/src/scheduler.rs b/kernel-orchestrator/src/scheduler.rs
+index e2a86f1..52578ff 100644
+--- a/kernel-orchestrator/src/scheduler.rs
++++ b/kernel-orchestrator/src/scheduler.rs
+@@ -26,7 +26,12 @@ impl Scheduler {
+     }
+ 
+     /// Spawns a new task. Terminated slots are reusable (patch 0005) so
+-    /// short-lived spawned programs do not exhaust the task table.
++    /// short-lived spawned programs do not exhaust the task table. When a
++    /// Terminated slot is reused, the dead task's recorded resources are
++    /// returned to the frame allocator first (patch 0006). Reap-at-reuse is
++    /// the safe point: some other task has run since the termination, so the
++    /// dead task's CR3 is no longer loaded and nothing references its kernel
++    /// stack.
+     pub fn spawn(&mut self, ctx: Context) -> Result<(), ()> {
+         for i in 0..MAX_TASKS {
+             let free = match &self.tasks[i] {
+@@ -34,6 +39,9 @@ impl Scheduler {
+                 Some(t) => t.state == TaskState::Terminated,
+             };
+             if free {
++                if let Some(dead) = &self.tasks[i] {
++                    crate::syscall::reap_context(dead);
++                }
+                 self.tasks[i] = Some(ctx);
+                 return Ok(());
+             }
+diff --git a/kernel-orchestrator/src/syscall.rs b/kernel-orchestrator/src/syscall.rs
+index 9dfcd28..0d48323 100644
+--- a/kernel-orchestrator/src/syscall.rs
++++ b/kernel-orchestrator/src/syscall.rs
+@@ -114,11 +114,24 @@ fn ramfs_file_ptr(filename: &str) -> Option<*const alloc::vec::Vec<u8>> {
+     found
+ }
+ 
++/// Everything `load_user_image` allocates, so callers can record it for
++/// reaping on exit (patch 0006).
++struct LoadedImage {
++    entry: u64,
++    cr3: u64,         // physical PML4 of the fresh address space
++    parent_cr3: u64,  // CR3 it was duplicated from (diff-walk baseline)
++    span_phys: u64,   // contiguous run holding the image data
++    span_frames: usize,
++    stack_phys: u64,  // contiguous run holding the user stack
++    stack_frames: usize,
++}
++
+ /// Load an ELF image into a fresh user address space derived from the
+-/// ACTIVE CR3 (the kernel half stays shared). Returns (entry, new_pml4_phys)
+-/// or None. Panics on frame-allocator OOM, matching the pre-existing EXEC
+-/// behavior. Used by both SYS_EXEC (replace caller) and SYS_SPAWN (new task).
+-fn load_user_image(elf_bytes: &[u8]) -> Option<(u64, u64)> {
++/// ACTIVE CR3 (the kernel half stays shared). Returns a `LoadedImage`
++/// describing every frame allocated, or None. Panics on frame-allocator
++/// OOM, matching the pre-existing EXEC behavior. Used by both SYS_EXEC
++/// (replace caller) and SYS_SPAWN (new task).
++fn load_user_image(elf_bytes: &[u8]) -> Option<LoadedImage> {
+     if elf_bytes.len() < core::mem::size_of::<kernel_kit::elf::Elf64_Ehdr>() {
+         return None;
+     }
+@@ -137,8 +150,11 @@ fn load_user_image(elf_bytes: &[u8]) -> Option<(u64, u64)> {
+     };
+     // Private page-table path for user image + stack so
+     // map_segment does not mutate tables shared with the caller.
++    // One call covers BOTH the image (0xFFFFFFFF80100000) and the user
++    // stack (0xFFFFFFFF800FE000): they share p4/p3/p2 indices (same 2 MiB
++    // region), so a second unshare would only duplicate the chain just
++    // created and orphan its three frames (patch 0006).
+     kernel_kit::paging::unshare_page_path(new_cr3, 0xFFFFFFFF80100000);
+-    kernel_kit::paging::unshare_page_path(new_cr3, 0xFFFFFFFF800FE000);
+     // PASS 1: scan phdrs to find the virtual span [vmin, vmax).
+     let mut vmin: u64 = u64::MAX;
+     let mut vmax: u64 = 0;
+@@ -218,9 +234,116 @@ fn load_user_image(elf_bytes: &[u8]) -> Option<(u64, u64)> {
+             0, stack_size,
+         );
+         kernel_kit::paging::map_segment(new_cr3, stack_vaddr, stack_phys, stack_size);
++
++        Some(LoadedImage {
++            entry: ehdr.e_entry,
++            cr3: new_cr3,
++            parent_cr3: active_cr3,
++            span_phys,
++            span_frames: span_nframes,
++            stack_phys,
++            stack_frames: 2,
++        })
+     }
++}
+ 
+-    Some((ehdr.e_entry, new_cr3))
++/// Free one frame through the global allocator (reap helper).
++fn free_one(phys: u64) {
++    let (fa, sif) = kernel_kit::memory::FRAME_ALLOCATOR.lock();
++    fa.free_frame(phys);
++    kernel_kit::memory::FRAME_ALLOCATOR.unlock(sif);
++}
++
++/// Serialize a u64 as decimal into `buf`, returning the written slice.
++fn u64_to_dec(mut v: u64, buf: &mut [u8; 20]) -> &[u8] {
++    let mut n = 0;
++    if v == 0 {
++        buf[0] = b'0';
++        return &buf[..1];
++    }
++    while v > 0 {
++        buf[n] = b'0' + (v % 10) as u8;
++        v /= 10;
++        n += 1;
++    }
++    for i in 0..n / 2 {
++        buf.swap(i, n - 1 - i);
++    }
++    &buf[..n]
++}
++
++fn serial_str(s: &str) {
++    let (sport, sif) = kernel_kit::serial::SERIAL1.lock();
++    for &b in s.as_bytes() {
++        sport.send(b);
++    }
++    kernel_kit::serial::SERIAL1.unlock(sif);
++}
++
++fn serial_u64(v: u64) {
++    let mut buf = [0u8; 20];
++    let s = u64_to_dec(v, &mut buf);
++    let (sport, sif) = kernel_kit::serial::SERIAL1.lock();
++    for &b in s {
++        sport.send(b);
++    }
++    kernel_kit::serial::SERIAL1.unlock(sif);
++}
++
++/// Return a terminated task's recorded resources to the frame allocator
++/// (patch 0006). Called by the scheduler when a Terminated slot is reused,
++/// so some other task has run since termination: the dead task's CR3 is no
++/// longer loaded and nothing references its kernel stack. Zero metadata
++/// fields skip — boot-spawned tasks (heap kernel stacks, no recorded
++/// bookkeeping) therefore reap as no-ops.
++///
++/// Scope: kernel stack frame, image span, user stack, and the task's PRIVATE
++/// page-table frames (diff-walk against parent_pml4). Data frames referenced
++/// by leaf PTEs are never freed by the walk itself: the image/stack runs are
++/// freed from the recorded metadata, and per-pid IPC RECV frames stay cached
++/// in IPC_PAGES for reuse. Address spaces replaced by SYS_EXEC still leak in
++/// this patch (their roots are not recorded as anyone's parent for freeing);
++/// that is the next candidate.
++pub fn reap_context(ctx: &kernel_kit::context::Context) {
++    let mut freed: usize = 0;
++
++    if ctx.parent_pml4 != 0
++        && ctx.page_table_root != 0
++        && ctx.page_table_root != ctx.parent_pml4
++    {
++        freed += kernel_kit::paging::free_private_tables(
++            ctx.page_table_root,
++            ctx.parent_pml4,
++        );
++    }
++
++    if ctx.kernel_stack_frame != 0 {
++        free_one(ctx.kernel_stack_frame);
++        freed += 1;
++    }
++    for i in 0..ctx.image_span_frames {
++        free_one(ctx.image_span_phys + (i as u64) * 4096);
++        freed += 1;
++    }
++    for i in 0..ctx.user_stack_frames {
++        free_one(ctx.user_stack_phys + (i as u64) * 4096);
++        freed += 1;
++    }
++
++    if freed > 0 {
++        let free_after = {
++            let (fa, sif) = kernel_kit::memory::FRAME_ALLOCATOR.lock();
++            let n = fa.free_count();
++            kernel_kit::memory::FRAME_ALLOCATOR.unlock(sif);
++            n
++        };
++        serial_str("\nREAP pid=");
++        serial_u64(ctx.id as u64);
++        serial_str(" freed=");
++        serial_u64(freed as u64);
++        serial_str(" free=");
++        serial_u64(free_after as u64);
++    }
+ }
+ 
+ /// The syscall dispatcher reads from the physical TrapFrame saved on the hardware stack.
+@@ -389,12 +512,12 @@ pub fn dispatch(ctx: &mut Context, mem: &mut MemoryPool, sched: &mut crate::sche
+         if let Ok(filename) = core::str::from_utf8(slice) {
+             if let Some(file_ptr) = ramfs_file_ptr(filename) {
+                 let elf_bytes = unsafe { &*file_ptr }.as_slice();
+-                if let Some((entry, new_cr3)) = load_user_image(elf_bytes) {
++                if let Some(img) = load_user_image(elf_bytes) {
+                     // Context Switch setup: replace the caller's
+                     // address space AND reset the user trap frame so
+                     // iretq enters the new image at a clean ABI
+                     // state (fresh stack top, zeroed GPRs).
+-                    trap_frame.rip = entry;
++                    trap_frame.rip = img.entry;
+                     trap_frame.rsp = 0xFFFFFFFF80100000;
+                     trap_frame.rflags = 0x202;
+                     trap_frame.cs = 0x1B;
+@@ -414,7 +537,17 @@ pub fn dispatch(ctx: &mut Context, mem: &mut MemoryPool, sched: &mut crate::sche
+                     trap_frame.rcx = 0;
+                     trap_frame.rbx = 0;
+                     trap_frame.rax = 0;
+-                    ctx.page_table_root = new_cr3;
++                    ctx.page_table_root = img.cr3;
++                    // Reap bookkeeping (patch 0006): the new root was
++                    // duplicated from the caller's active CR3. The REPLACED
++                    // address space still leaks in this patch — freeing it
++                    // here would be unsafe while children spawned from it
++                    // may hold it as their diff-walk baseline.
++                    ctx.parent_pml4 = img.parent_cr3;
++                    ctx.image_span_phys = img.span_phys;
++                    ctx.image_span_frames = img.span_frames;
++                    ctx.user_stack_phys = img.stack_phys;
++                    ctx.user_stack_frames = img.stack_frames;
+ 
+                     // Clean up file descriptors
+                     for i in 0..16 {
+@@ -443,33 +576,86 @@ pub fn dispatch(ctx: &mut Context, mem: &mut MemoryPool, sched: &mut crate::sche
+         let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
+         if let Ok(filename) = core::str::from_utf8(slice) {
+             if let Some(pid) = sched.alloc_pid() {
++                // Baseline free-frame count BEFORE this spawn allocates
++                // anything; the REAP diagnostic prints the post-reap count
++                // so the boot gate can verify the allocator returns to it
++                // (patch 0006).
++                let free_before = {
++                    let (fa, sif) = kernel_kit::memory::FRAME_ALLOCATOR.lock();
++                    let n = fa.free_count();
++                    kernel_kit::memory::FRAME_ALLOCATOR.unlock(sif);
++                    n
++                };
+                 if let Some(file_ptr) = ramfs_file_ptr(filename) {
+                     let elf_bytes = unsafe { &*file_ptr }.as_slice();
+-                    if let Some((entry, new_cr3)) = load_user_image(elf_bytes) {
+-                        // Kernel stack for the new task's trap frames.
+-                        let mut kernel_stack = alloc::vec::Vec::<u8>::with_capacity(4096);
+-                        kernel_stack.resize(4096, 0);
+-                        let kernel_stack_top = kernel_stack.as_ptr() as u64 + 4096;
+-                        core::mem::forget(kernel_stack);
+-
+-                        let tf = kernel_kit::trap::TrapFrame::new_user(entry, 0xFFFFFFFF80100000);
+-                        let frame_ptr = (kernel_stack_top
+-                            - core::mem::size_of::<kernel_kit::trap::TrapFrame>() as u64)
+-                            as *mut kernel_kit::trap::TrapFrame;
+-                        unsafe { *frame_ptr = tf; }
+-
+-                        let new_ctx = kernel_kit::context::Context::new(
+-                            pid,
+-                            frame_ptr as u64,
+-                            kernel_stack_top,
+-                            new_cr3,
++                    // Kernel stack for the new task's trap frames, from the
++                    // FRAME allocator (patch 0006): the bump/slab kernel heap
++                    // cannot free individual blocks, so a heap stack would
++                    // leak forever. A frame lives in the bootloader's
++                    // physical-memory window, which every duplicated CR3 keeps
++                    // mapped, and is 4 KiB-aligned (the old heap stacks were
++                    // align-1). 4096 bytes hold the TrapFrame (168 B) plus
++                    // the 512 B XMM block the wrappers reserve below it.
++                    let kernel_stack_frame = {
++                        let (fa, sif) = kernel_kit::memory::FRAME_ALLOCATOR.lock();
++                        let r = fa.alloc_frame();
++                        kernel_kit::memory::FRAME_ALLOCATOR.unlock(sif);
++                        r
++                    };
++                    let kernel_stack_frame = match kernel_stack_frame {
++                        Some(f) => f,
++                        None => { trap_frame.rax = u64::MAX; return; }
++                    };
++                    let kernel_stack_top =
++                        kernel_kit::paging::phys_to_virt(kernel_stack_frame) + 4096;
++                    unsafe {
++                        core::ptr::write_bytes(
++                            kernel_kit::paging::phys_to_virt(kernel_stack_frame) as *mut u8,
++                            0, 4096,
+                         );
+-                        match sched.spawn(new_ctx) {
+-                            Ok(()) => trap_frame.rax = pid as u64,
+-                            Err(()) => trap_frame.rax = u64::MAX,
++                    }
++                    match load_user_image(elf_bytes) {
++                        Some(img) => {
++                            let tf = kernel_kit::trap::TrapFrame::new_user(img.entry, 0xFFFFFFFF80100000);
++                            let frame_ptr = (kernel_stack_top
++                                - core::mem::size_of::<kernel_kit::trap::TrapFrame>() as u64)
++                                as *mut kernel_kit::trap::TrapFrame;
++                            unsafe { *frame_ptr = tf; }
++
++                            let mut new_ctx = kernel_kit::context::Context::new(
++                                pid,
++                                frame_ptr as u64,
++                                kernel_stack_top,
++                                img.cr3,
++                            );
++                            new_ctx.parent_pml4 = img.parent_cr3;
++                            new_ctx.image_span_phys = img.span_phys;
++                            new_ctx.image_span_frames = img.span_frames;
++                            new_ctx.user_stack_phys = img.stack_phys;
++                            new_ctx.user_stack_frames = img.stack_frames;
++                            new_ctx.kernel_stack_frame = kernel_stack_frame;
++
++                            match sched.spawn(new_ctx.clone()) {
++                                Ok(()) => {
++                                    serial_str("\nSPAWN pid=");
++                                    serial_u64(pid as u64);
++                                    serial_str(" free_before=");
++                                    serial_u64(free_before as u64);
++                                    trap_frame.rax = pid as u64;
++                                }
++                                Err(()) => {
++                                    // Unreachable in practice (alloc_pid
++                                    // implies a free slot), but keep the
++                                    // allocator honest if it ever happens.
++                                    reap_context(&new_ctx);
++                                    trap_frame.rax = u64::MAX;
++                                }
++                            }
++                        }
++                        None => {
++                            free_one(kernel_stack_frame);
++                            trap_frame.rax = u64::MAX;
+                         }
+-                    } else {
+-                        trap_frame.rax = u64::MAX;
+                     }
+                 } else {
+                     trap_frame.rax = u64::MAX;

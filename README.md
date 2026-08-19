@@ -13,9 +13,13 @@ The workflow `.github/workflows/boot-test.yml` clones
 keystrokes over QMP, and greps serial output.
 
 Gates: `BANNER_OK`, `HEAP_OK`, `BENCH_OK`, `DAEMON_OK`, `KEYBOARD_OK`,
-`RAMFS_OK`, `EXEC_OK` — all seven green (2026-08-18, KVM-verified):
-`run hello.elf` execs, prints `hello from ATOM OS System`, and exits
-cleanly while the daemon keeps running. The old runtime #GP was never
+`RAMFS_OK`, `EXEC_OK`, `IPC_OK`, `SPAWN_OK`, `REAP_OK`,
+`REAP_FRAMES_OK`, `LEAK_CLOSED` — all twelve green (2026-08-19,
+KVM-verified): `run hello.elf` execs, prints `hello from ATOM OS
+System`, and exits cleanly while the daemon keeps running; `spawn`
+runs a second process beside the shell; and the second spawn reaps
+the exited task's frames — the allocator free-count returns exactly
+to its pre-spawn value (patch 0006). The old runtime #GP was never
 kernel-side: the `program!` macro's `_start` was an ordinary Rust fn
 compiled assuming `rsp ≡ 8 (mod 16)` at entry (the CALL convention),
 while iretq process entry starts with `rsp ≡ 0` — every stack-slot
@@ -50,6 +54,16 @@ verified correct.
    The EXEC image-loading code is extracted into `load_user_image` and
    shared by both syscalls; the scheduler reclaims Terminated slots and
    hands out the lowest free pid 1..15.
+6. `patches/0006-reap-spawned-task-resources-on-exit.patch` — when a
+   Terminated slot is reused, the dead task's resources return to the
+   frame allocator: its frame-backed kernel stack, image span, user
+   stack, and every private page-table frame (diff-walk against the
+   parent CR3; shared subtrees, leaf data frames, and cached IPC RECV
+   frames untouched). Spawned kernel stacks move from the un-freeable
+   kernel heap to the frame allocator, and the redundant second
+   `unshare_page_path` in the loader (same 2 MiB path as the first)
+   stops orphaning three frames per image load. Address spaces replaced
+   by EXEC still leak (documented in ARCHITECTURE.md).
 
 These patches are not yet landed on `atom-os-kernel` itself (except the
 yield fix on HEAD); applying them here is the integration path.

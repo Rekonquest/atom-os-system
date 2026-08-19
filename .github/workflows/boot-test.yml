@@ -49,6 +49,7 @@ jobs:
           git -C "$K" apply "$GITHUB_WORKSPACE/patches/0003-ipc-byte-mailboxes-and-frame-recv-pages.patch"
           git -C "$K" apply "$GITHUB_WORKSPACE/patches/0004-xmm-save-restore-in-interrupt-wrappers.patch"
           git -C "$K" apply "$GITHUB_WORKSPACE/patches/0005-sys-spawn-runtime-process-creation.patch"
+          git -C "$K" apply "$GITHUB_WORKSPACE/patches/0006-reap-spawned-task-resources-on-exit.patch"
 
       - name: Build userspace programs
         run: |
@@ -141,6 +142,19 @@ jobs:
                   sendkey(k)
           time.sleep(2.5)
 
+          # Second spawn: the first hello has exited, so its slot is
+          # Terminated and the scheduler reaps it (patch 0006) before
+          # reuse. The REAP/LEAK gates below read the diagnostics this
+          # prints on serial.
+          for k in list("spawn hello.elf") + ["ret"]:
+              if k == " ":
+                  sendkey("spc")
+              elif k == ".":
+                  sendkey("dot")
+              else:
+                  sendkey(k)
+          time.sleep(2.5)
+
           # Prove SYS_EXEC: run hello.elf (replaces shell).
           for k in list("run hello.elf") + ["ret"]:
               # space is qcode "spc", '.' is "dot"
@@ -211,5 +225,33 @@ jobs:
             echo "SPAWN_OK"
           else
             echo "SPAWN_MISSING"; fail=1
+          fi
+          if grep -q "REAP pid=" qemu.log; then
+            echo "REAP_OK"
+          else
+            echo "REAP_MISSING"; fail=1
+          fi
+          freed=$(grep -o "REAP pid=[0-9]* freed=[0-9]*" qemu.log | head -1 | sed "s/.*freed=//")
+          if [ -n "$freed" ] && [ "$freed" -ge 8 ]; then
+            # 4 private page-table frames + kernel stack + image span +
+            # 2 user-stack frames is the minimum a spawn can consume.
+            echo "REAP_FRAMES_OK (freed=$freed)"
+          else
+            echo "REAP_FRAMES_LOW (freed=${freed:-none})"; fail=1
+          fi
+          # Exact leak-closed invariant: the REAP line prints the free-frame
+          # count right after returning the dead task's frames; the LAST
+          # SPAWN line belongs to the spawn whose slot reuse performed that
+          # reap, and its free_before was captured just before that spawn's
+          # own allocations. Between the two measurements only that spawn's
+          # allocations and the reap happen, so equality proves the reap
+          # returned precisely what a spawn consumes. (Daemon IPC RECV
+          # caching allocates outside this window and cannot perturb it.)
+          before=$(grep -o "SPAWN pid=[0-9]* free_before=[0-9]*" qemu.log | tail -1 | sed "s/.*free_before=//")
+          after=$(grep -o "REAP pid=[0-9]* freed=[0-9]* free=[0-9]*" qemu.log | tail -1 | sed "s/.*free=//")
+          if [ -n "$before" ] && [ "$after" = "$before" ]; then
+            echo "LEAK_CLOSED (free_before=$before free_after_reap=$after)"
+          else
+            echo "LEAK_OPEN (free_before=${before:-none} free_after_reap=${after:-none})"; fail=1
           fi
           exit $fail
