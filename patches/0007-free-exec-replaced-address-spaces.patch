@@ -1,0 +1,410 @@
+diff --git a/kernel-kit/src/context.rs b/kernel-kit/src/context.rs
+index 4dbbc9f..3c31d60 100644
+--- a/kernel-kit/src/context.rs
++++ b/kernel-kit/src/context.rs
+@@ -26,9 +26,12 @@ pub struct Context {
+     /// CR3 that page_table_root was duplicated from. 0 = page_table_root is
+     /// not a duplicate (never free its tables).
+     pub parent_pml4: u64,
+-    /// Contiguous physical run holding the loaded image data.
++    /// Contiguous physical run holding the loaded image data, and the
++    /// page-aligned virtual address it is mapped at (needed by patch 0007
++    /// to zero stale inherited PTEs when this address space is copied).
+     pub image_span_phys: u64,
+     pub image_span_frames: usize,
++    pub image_span_vaddr: u64,
+     /// Contiguous physical run holding the user stack.
+     pub user_stack_phys: u64,
+     pub user_stack_frames: usize,
+@@ -50,6 +53,7 @@ impl Context {
+             parent_pml4: 0,
+             image_span_phys: 0,
+             image_span_frames: 0,
++            image_span_vaddr: 0,
+             user_stack_phys: 0,
+             user_stack_frames: 0,
+             kernel_stack_frame: 0,
+diff --git a/kernel-kit/src/paging.rs b/kernel-kit/src/paging.rs
+index 7761837..101297a 100644
+--- a/kernel-kit/src/paging.rs
++++ b/kernel-kit/src/paging.rs
+@@ -392,3 +392,154 @@ fn free_one_frame(phys: u64) {
+     fa.free_frame(phys);
+     crate::memory::FRAME_ALLOCATOR.unlock(sif);
+ }
++
++/// Zero the leaf PTEs of `pml4` mapping the virtual range
++/// [vaddr_start, vaddr_start + bytes) (patch 0007). Used when a freshly
++/// copied address space must not keep aliases into the source task's
++/// image frames: after `unshare_page_path` the private PT still holds the
++/// source's PTEs; this clears them before `map_segment` writes the new
++/// ones. Absent intermediate levels are skipped (nothing to clear).
++/// Contract: `pml4_phys` must not be any running task's active CR3 (the
++/// fresh copy is not loaded until the syscall return path switches to it,
++/// so no TLB shootdown is needed).
++pub fn clear_ptes_range(pml4_phys: u64, vaddr_start: u64, bytes: usize) {
++    if bytes == 0 || pml4_phys == 0 {
++        return;
++    }
++    let mut va = vaddr_start & !0xFFF;
++    let end = vaddr_start + bytes as u64;
++    unsafe {
++        while va < end {
++            let v = VirtualAddress(va);
++            let pml4 = &mut *(phys_to_virt(pml4_phys) as *mut PageTable);
++            let p4 = pml4.entries[v.p4_index()].0;
++            if (p4 & 1) != 0 && (p4 & (1 << 7)) == 0 {
++                let pdpt = &mut *(phys_to_virt(p4 & 0x000FFFFFFFFFF000) as *mut PageTable);
++                let p3 = pdpt.entries[v.p3_index()].0;
++                if (p3 & 1) != 0 && (p3 & (1 << 7)) == 0 {
++                    let pd = &mut *(phys_to_virt(p3 & 0x000FFFFFFFFFF000) as *mut PageTable);
++                    let p2 = pd.entries[v.p2_index()].0;
++                    if (p2 & 1) != 0 && (p2 & (1 << 7)) == 0 {
++                        let pt = &mut *(phys_to_virt(p2 & 0x000FFFFFFFFFF000) as *mut PageTable);
++                        pt.entries[v.p1_index()].0 = 0;
++                    }
++                }
++            }
++            va += PAGE_SIZE;
++        }
++    }
++}
++
++/// Collect (without freeing) the exact frame set `free_private_tables`
++/// would release, EXCLUDING `child_pml4` itself (the caller handles the
++/// root frame). Returns the count written to `out`; truncates silently at
++/// `out` capacity (truncation only ever turns a free into a leak — never
++/// unsafe). Patch 0007 uses this for EXEC-time freeing, where each frame
++/// needs an individual reachability check before release.
++pub fn collect_private_frames(child_pml4: u64, parent_pml4: u64, out: &mut [u64]) -> usize {
++    if child_pml4 == 0 || parent_pml4 == 0 || child_pml4 == parent_pml4 {
++        return 0;
++    }
++    let mut n = 0;
++    unsafe {
++        let child = &*(phys_to_virt(child_pml4) as *const PageTable);
++        let parent = &*(phys_to_virt(parent_pml4) as *const PageTable);
++        for i in 0..512 {
++            let c = child.entries[i].0;
++            if (c & 1) == 0 { continue; }
++            if (c & (1 << 7)) != 0 { continue; } // reserved at PML4; skip defensively
++            let c_addr = c & 0x000FFFFFFFFFF000;
++            let p = parent.entries[i].0;
++            if (p & 1) != 0 && (p & 0x000FFFFFFFFFF000) == c_addr {
++                continue; // shared subtree
++            }
++            let parent_next = if (p & 1) != 0 {
++                Some(p & 0x000FFFFFFFFFF000)
++            } else {
++                None
++            };
++            n = collect_table_subtree(c_addr, parent_next, 3, out, n);
++            if n < out.len() {
++                out[n] = c_addr;
++                n += 1;
++            }
++        }
++    }
++    n
++}
++
++unsafe fn collect_table_subtree(
++    tbl_phys: u64,
++    parent_tbl: Option<u64>,
++    level: usize,
++    out: &mut [u64],
++    n_in: usize,
++) -> usize {
++    unsafe {
++        let mut n = n_in;
++        let tbl = &*(phys_to_virt(tbl_phys) as *const PageTable);
++        for i in 0..512 {
++            let e = tbl.entries[i].0;
++            if (e & 1) == 0 { continue; }
++            if (e & (1 << 7)) != 0 { continue; } // huge leaf: data, copied from parent
++            let e_addr = e & 0x000FFFFFFFFFF000;
++            let mut pe: u64 = 0;
++            if let Some(pt_phys) = parent_tbl {
++                let pt = &*(phys_to_virt(pt_phys) as *const PageTable);
++                pe = pt.entries[i].0;
++                if (pe & 1) != 0 && (pe & 0x000FFFFFFFFFF000) == e_addr {
++                    continue; // shared at this level too
++                }
++            }
++            if level > 1 {
++                let parent_next = if (pe & 1) != 0 {
++                    Some(pe & 0x000FFFFFFFFFF000)
++                } else {
++                    None
++                };
++                n = collect_table_subtree(e_addr, parent_next, level - 1, out, n);
++                if n < out.len() {
++                    out[n] = e_addr;
++                    n += 1;
++                }
++            }
++            // level == 1: e_addr is a leaf data frame — tracked elsewhere.
++        }
++        n
++    }
++}
++
++/// True iff the page-table frame `target` is reachable from the tree
++/// rooted at `root_phys` — i.e. it IS `root_phys`, or some table in the
++/// tree points at it (directly or transitively). Leaf data frames are not
++/// followed. Patch 0007 uses this to protect frames that other address
++/// spaces still reference when freeing an EXEC-replaced address space.
++pub fn frame_reachable(root_phys: u64, target: u64) -> bool {
++    if root_phys == 0 {
++        return false;
++    }
++    if root_phys == target {
++        return true;
++    }
++    // The root is a PML4; its entries target PDPTs (level 3).
++    unsafe { reachable_below(root_phys, target, 3) }
++}
++
++unsafe fn reachable_below(tbl_phys: u64, target: u64, level: usize) -> bool {
++    unsafe {
++        let tbl = &*(phys_to_virt(tbl_phys) as *const PageTable);
++        for i in 0..512 {
++            let e = tbl.entries[i].0;
++            if (e & 1) == 0 { continue; }
++            if (e & (1 << 7)) != 0 { continue; } // huge leaf: data region
++            let e_addr = e & 0x000FFFFFFFFFF000;
++            if e_addr == target {
++                return true;
++            }
++            if level > 1 && reachable_below(e_addr, target, level - 1) {
++                return true;
++            }
++        }
++        false
++    }
++}
+diff --git a/kernel-orchestrator/src/scheduler.rs b/kernel-orchestrator/src/scheduler.rs
+index 52578ff..4a8d5d5 100644
+--- a/kernel-orchestrator/src/scheduler.rs
++++ b/kernel-orchestrator/src/scheduler.rs
+@@ -64,6 +64,33 @@ impl Scheduler {
+         None
+     }
+ 
++    /// Rewrite the diff-walk baseline of every task holding `old` to `new`
++    /// (patch 0007). Called at EXEC, before the replaced root `old` is
++    /// freed. Sound because each affected task replaced the only region
++    /// where `old` differs from `new`'s lineage (the image/stack chain)
++    /// with its own private chain at creation — its diff-walk frees the
++    /// identical frame set against either baseline.
++    pub fn rebaseline(&mut self, old: u64, new: u64) {
++        for t in self.tasks.iter_mut().flatten() {
++            if t.parent_pml4 == old {
++                t.parent_pml4 = new;
++            }
++        }
++    }
++
++    /// True if any task's current address space can reach `frame` through
++    /// its page tables (patch 0007). Used to protect frames that other
++    /// roots still reference — e.g. an IPC RECV chain inherited by shallow
++    /// copy — when an EXEC-replaced address space is freed.
++    pub fn root_reaches(&self, frame: u64) -> bool {
++        for t in self.tasks.iter().flatten() {
++            if kernel_kit::paging::frame_reachable(t.page_table_root, frame) {
++                return true;
++            }
++        }
++        false
++    }
++
+     /// Called by the Timer Interrupt. Takes the interrupted task's stack pointer,
+     /// saves the full TrapFrame, and returns the next task's stack pointer.
+     pub fn switch_context(&mut self, old_rsp: u64) -> u64 {
+diff --git a/kernel-orchestrator/src/syscall.rs b/kernel-orchestrator/src/syscall.rs
+index 0d48323..a3c7bc1 100644
+--- a/kernel-orchestrator/src/syscall.rs
++++ b/kernel-orchestrator/src/syscall.rs
+@@ -122,6 +122,7 @@ struct LoadedImage {
+     parent_cr3: u64,  // CR3 it was duplicated from (diff-walk baseline)
+     span_phys: u64,   // contiguous run holding the image data
+     span_frames: usize,
++    span_vaddr: u64,  // page-aligned virtual start of the span
+     stack_phys: u64,  // contiguous run holding the user stack
+     stack_frames: usize,
+ }
+@@ -131,7 +132,15 @@ struct LoadedImage {
+ /// describing every frame allocated, or None. Panics on frame-allocator
+ /// OOM, matching the pre-existing EXEC behavior. Used by both SYS_EXEC
+ /// (replace caller) and SYS_SPAWN (new task).
+-fn load_user_image(elf_bytes: &[u8]) -> Option<LoadedImage> {
++///
++/// `old_span` is the (vaddr, bytes) image span currently mapped in the
++/// source address space — the caller's own span for EXEC, the spawning
++/// task's span for SPAWN — or (0, 0) when the source is the boot CR3
++/// (no user image mapped yet). The fresh copy's private PT inherits the
++/// source's PTEs for that range; they are zeroed here (patch 0007) so the
++/// new root holds no aliases into the source's image frames, which is
++/// what lets the source's frames be freed when it is replaced/reaped.
++fn load_user_image(elf_bytes: &[u8], old_span: (u64, usize)) -> Option<LoadedImage> {
+     if elf_bytes.len() < core::mem::size_of::<kernel_kit::elf::Elf64_Ehdr>() {
+         return None;
+     }
+@@ -155,6 +164,12 @@ fn load_user_image(elf_bytes: &[u8]) -> Option<LoadedImage> {
+     // region), so a second unshare would only duplicate the chain just
+     // created and orphan its three frames (patch 0006).
+     kernel_kit::paging::unshare_page_path(new_cr3, 0xFFFFFFFF80100000);
++    // Patch 0007: cut the inherited aliases into the source's image
++    // frames BEFORE mapping the new image. new_cr3 is not the active CR3
++    // (no TLB concern); the user-stack PTEs need no clearing because the
++    // stack mapping below rewrites exactly those two slots at the same
++    // virtual addresses.
++    kernel_kit::paging::clear_ptes_range(new_cr3, old_span.0, old_span.1);
+     // PASS 1: scan phdrs to find the virtual span [vmin, vmax).
+     let mut vmin: u64 = u64::MAX;
+     let mut vmax: u64 = 0;
+@@ -241,6 +256,7 @@ fn load_user_image(elf_bytes: &[u8]) -> Option<LoadedImage> {
+             parent_cr3: active_cr3,
+             span_phys,
+             span_frames: span_nframes,
++            span_vaddr: span_start_vaddr,
+             stack_phys,
+             stack_frames: 2,
+         })
+@@ -512,7 +528,19 @@ pub fn dispatch(ctx: &mut Context, mem: &mut MemoryPool, sched: &mut crate::sche
+         if let Ok(filename) = core::str::from_utf8(slice) {
+             if let Some(file_ptr) = ramfs_file_ptr(filename) {
+                 let elf_bytes = unsafe { &*file_ptr }.as_slice();
+-                if let Some(img) = load_user_image(elf_bytes) {
++                // Snapshot the address space being replaced BEFORE the
++                // context metadata is overwritten (patch 0007).
++                let old_root = ctx.page_table_root;
++                let old_parent = ctx.parent_pml4;
++                let old_span_phys = ctx.image_span_phys;
++                let old_span_frames = ctx.image_span_frames;
++                let old_span_vaddr = ctx.image_span_vaddr;
++                let old_stack_phys = ctx.user_stack_phys;
++                let old_stack_frames = ctx.user_stack_frames;
++                if let Some(img) = load_user_image(
++                    elf_bytes,
++                    (old_span_vaddr, old_span_frames * 4096),
++                ) {
+                     // Context Switch setup: replace the caller's
+                     // address space AND reset the user trap frame so
+                     // iretq enters the new image at a clean ABI
+@@ -538,14 +566,86 @@ pub fn dispatch(ctx: &mut Context, mem: &mut MemoryPool, sched: &mut crate::sche
+                     trap_frame.rbx = 0;
+                     trap_frame.rax = 0;
+                     ctx.page_table_root = img.cr3;
+-                    // Reap bookkeeping (patch 0006): the new root was
+-                    // duplicated from the caller's active CR3. The REPLACED
+-                    // address space still leaks in this patch — freeing it
+-                    // here would be unsafe while children spawned from it
+-                    // may hold it as their diff-walk baseline.
+-                    ctx.parent_pml4 = img.parent_cr3;
++
++                    // Patch 0007: free the REPLACED address space.
++                    //
++                    // Safety argument, three parts:
++                    // 1. Stale aliases: every root copied from old_root
++                    //    (the new root above, and every earlier spawned
++                    //    child) had old_root's image PTEs zeroed at its
++                    //    own creation, so nothing outside old_root
++                    //    references old_root's image/stack frames.
++                    // 2. Baselines: tasks holding old_root as their
++                    //    diff-walk baseline are rebaselined to old_parent
++                    //    FIRST. That rebaseline is sound regardless of the
++                    //    free, because each such task replaced the only
++                    //    region where old_root differs from old_parent
++                    //    (the image/stack chain) with its own private
++                    //    chain at creation — the diff-walk frees the same
++                    //    set against either baseline. After the rebaseline
++                    //    no task holds old_root as a baseline, so freeing
++                    //    it cannot strand a future walk.
++                    // 3. Reachability: any private frame of old_root that
++                    //    some other root still references (e.g. an IPC
++                    //    RECV chain inherited by shallow copy) is deferred,
++                    //    never freed. Known limit: if the shell ever RECVs
++                    //    and then spawns and then execs, such an inherited
++                    //    chain can later be freed by a reap of the exec
++                    //    lineage (the walk sees it as private vs
++                    //    old_parent). No current userspace program RECVs
++                    //    except the daemon, which never spawns or execs.
++                    let mut freed = 0u64;
++                    let mut deferred = 0u64;
++                    let freeable = old_parent != 0
++                        && old_root != 0
++                        && old_root != old_parent;
++                    if freeable {
++                        sched.rebaseline(old_root, old_parent);
++                        let mut priv_buf = [0u64; 64];
++                        let n = kernel_kit::paging::collect_private_frames(
++                            old_root,
++                            old_parent,
++                            &mut priv_buf,
++                        );
++                        for i in 0..n {
++                            let f = priv_buf[i];
++                            if sched.root_reaches(f) {
++                                deferred += 1;
++                            } else {
++                                free_one(f);
++                                freed += 1;
++                            }
++                        }
++                        // The PML4 frame itself: never referenced as a
++                        // subtable by any other root (roots are unique per
++                        // allocation, and no task holds old_root as a
++                        // baseline after the rebaseline).
++                        free_one(old_root);
++                        freed += 1;
++                        for i in 0..old_span_frames {
++                            free_one(old_span_phys + (i as u64) * 4096);
++                            freed += 1;
++                        }
++                        for i in 0..old_stack_frames {
++                            free_one(old_stack_phys + (i as u64) * 4096);
++                            freed += 1;
++                        }
++                        serial_str("\nEXECFREE pid=");
++                        serial_u64(ctx.id as u64);
++                        serial_str(" freed=");
++                        serial_u64(freed);
++                        serial_str(" deferred=");
++                        serial_u64(deferred);
++                    }
++                    // The new root's baseline: old_parent when old_root
++                    // was released, otherwise old_root itself (still valid
++                    // — e.g. the boot CR3 at the initial spawn_process
++                    // exec, which is never freed).
++                    ctx.parent_pml4 = if freeable { old_parent } else { img.parent_cr3 };
++
+                     ctx.image_span_phys = img.span_phys;
+                     ctx.image_span_frames = img.span_frames;
++                    ctx.image_span_vaddr = img.span_vaddr;
+                     ctx.user_stack_phys = img.stack_phys;
+                     ctx.user_stack_frames = img.stack_frames;
+ 
+@@ -614,7 +714,13 @@ pub fn dispatch(ctx: &mut Context, mem: &mut MemoryPool, sched: &mut crate::sche
+                             0, 4096,
+                         );
+                     }
+-                    match load_user_image(elf_bytes) {
++                    match load_user_image(
++                        elf_bytes,
++                        // Patch 0007: zero the spawning task's image PTEs
++                        // in the child's private PT so the child holds no
++                        // aliases into the spawner's image frames.
++                        (ctx.image_span_vaddr, ctx.image_span_frames * 4096),
++                    ) {
+                         Some(img) => {
+                             let tf = kernel_kit::trap::TrapFrame::new_user(img.entry, 0xFFFFFFFF80100000);
+                             let frame_ptr = (kernel_stack_top
+@@ -631,6 +737,7 @@ pub fn dispatch(ctx: &mut Context, mem: &mut MemoryPool, sched: &mut crate::sche
+                             new_ctx.parent_pml4 = img.parent_cr3;
+                             new_ctx.image_span_phys = img.span_phys;
+                             new_ctx.image_span_frames = img.span_frames;
++                            new_ctx.image_span_vaddr = img.span_vaddr;
+                             new_ctx.user_stack_phys = img.stack_phys;
+                             new_ctx.user_stack_frames = img.stack_frames;
+                             new_ctx.kernel_stack_frame = kernel_stack_frame;

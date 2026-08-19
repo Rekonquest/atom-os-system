@@ -14,20 +14,22 @@ keystrokes over QMP, and greps serial output.
 
 Gates: `BANNER_OK`, `HEAP_OK`, `BENCH_OK`, `DAEMON_OK`, `KEYBOARD_OK`,
 `RAMFS_OK`, `EXEC_OK`, `IPC_OK`, `SPAWN_OK`, `REAP_OK`,
-`REAP_FRAMES_OK`, `LEAK_CLOSED` — all twelve green (2026-08-19,
-KVM-verified): `run hello.elf` execs, prints `hello from ATOM OS
-System`, and exits cleanly while the daemon keeps running; `spawn`
-runs a second process beside the shell; and the second spawn reaps
-the exited task's frames — the allocator free-count returns exactly
-to its pre-spawn value (patch 0006). The old runtime #GP was never
-kernel-side: the `program!` macro's `_start` was an ordinary Rust fn
-compiled assuming `rsp ≡ 8 (mod 16)` at entry (the CALL convention),
-while iretq process entry starts with `rsp ≡ 0` — every stack-slot
-alignment downstream was off by 8, and the first rsp-relative `movaps`
-(zeroing the path buffer in `sys::exec`) faulted with #GP(0). Fixed by
-making `_start` an asm stub that CALLs the Rust entry. Patch 0002's
-exec machinery (frame reset, CR3 reload, page-table path unsharing) is
-verified correct.
+`REAP_FRAMES_OK`, `LEAK_CLOSED`, `FIELD_EXEC_OK`, `EXECFREE_OK` — all
+fourteen green (2026-08-19, KVM-verified): `run fieldmon.elf` execs
+and fieldmon runs its field rounds while the daemon keeps running;
+`spawn` runs a second process beside the shell; the second spawn reaps
+the exited task's frames — the allocator free-count returns exactly to
+its pre-spawn value (patch 0006); and the exec itself frees the
+replaced address space — exactly 42 frames for the shell, matching its
+ELF span arithmetic, nothing deferred (patch 0007). The old runtime
+#GP was never kernel-side: the `program!` macro's `_start` was an
+ordinary Rust fn compiled assuming `rsp ≡ 8 (mod 16)` at entry (the
+CALL convention), while iretq process entry starts with `rsp ≡ 0` —
+every stack-slot alignment downstream was off by 8, and the first
+rsp-relative `movaps` (zeroing the path buffer in `sys::exec`) faulted
+with #GP(0). Fixed by making `_start` an asm stub that CALLs the Rust
+entry. Patch 0002's exec machinery (frame reset, CR3 reload,
+page-table path unsharing) is verified correct.
 
 **Required kernel patches** (applied by the workflow after checkout):
 
@@ -62,8 +64,17 @@ verified correct.
    frames untouched). Spawned kernel stacks move from the un-freeable
    kernel heap to the frame allocator, and the redundant second
    `unshare_page_path` in the loader (same 2 MiB path as the first)
-   stops orphaning three frames per image load. Address spaces replaced
-   by EXEC still leak (documented in ARCHITECTURE.md).
+   stops orphaning three frames per image load.
+7. `patches/0007-free-exec-replaced-address-spaces.patch` — EXEC now
+   frees the address space it replaces, closing the last loader leak.
+   The loader zeroes the source's stale image PTEs in every fresh copy
+   (EXEC and SPAWN alike), and EXEC rebaselines tasks that held the old
+   root as their diff-walk baseline before freeing it — the walk
+   frees the identical frame set against either baseline, since each
+   task replaced the only differing region with its own private chain.
+   Any frame another root still reaches is deferred, never freed. With
+   0006+0007 the loader allocates and frees cleanly: `spawn` churn and
+   `run` both return their frames to the pool.
 
 These patches are not yet landed on `atom-os-kernel` itself (except the
 yield fix on HEAD); applying them here is the integration path.

@@ -25,6 +25,7 @@ git -C atom-os-kernel apply "$SYSROOT/patches/0003-ipc-byte-mailboxes-and-frame-
 git -C atom-os-kernel apply "$SYSROOT/patches/0004-xmm-save-restore-in-interrupt-wrappers.patch"
 git -C atom-os-kernel apply "$SYSROOT/patches/0005-sys-spawn-runtime-process-creation.patch"
 git -C atom-os-kernel apply "$SYSROOT/patches/0006-reap-spawned-task-resources-on-exit.patch"
+git -C atom-os-kernel apply "$SYSROOT/patches/0007-free-exec-replaced-address-spaces.patch"
 
 for p in hello daemon shell fieldmon; do
     (cd "$SYSROOT/programs/$p" && cargo +nightly build -Zjson-target-spec --release --quiet)
@@ -108,7 +109,9 @@ for k in list("spawn hello.elf") + ["ret"]:
     else:
         sendkey(k)
 time.sleep(2.5)
-for k in list("run hello.elf") + ["ret"]:
+# Patch 0007: exec fieldmon so EXECFREE fires with spawned children
+# still holding the old root as baseline (the rebaseline path).
+for k in list("run fieldmon.elf") + ["ret"]:
     if k == " ":
         sendkey("spc")
     elif k == ".":
@@ -134,6 +137,10 @@ if grep -q "Daemon" qemu.log; then echo "DAEMON_OK"; else echo "DAEMON_MISSING (
 if grep -q "commands:" qemu.log; then echo "KEYBOARD_OK"; else echo "KEYBOARD_MISSING"; fail=1; fi
 if grep -q "hello.elf" qemu.log && grep -q "fieldmon.elf" qemu.log; then echo "RAMFS_OK"; else echo "RAMFS_MISSING"; fail=1; fi
 if grep -q "hello from ATOM OS System" qemu.log; then echo "EXEC_OK"; else echo "EXEC_MISSING"; fail=1; fi
+if grep -q "fieldmon: observing" qemu.log; then echo "FIELD_EXEC_OK"; else echo "FIELD_EXEC_MISSING"; fail=1; fi
+efreed=$(grep -o "EXECFREE pid=[0-9]* freed=[0-9]*" qemu.log | head -1 | sed "s/.*freed=//")
+edefer=$(grep -o "EXECFREE pid=[0-9]* freed=[0-9]* deferred=[0-9]*" qemu.log | head -1 | sed "s/.*deferred=//")
+if [ -n "$efreed" ] && [ "$efreed" -ge 8 ] && [ "${edefer:-X}" = "0" ]; then echo "EXECFREE_OK (freed=$efreed deferred=$edefer)"; else echo "EXECFREE_BAD (freed=${efreed:-none} deferred=${edefer:-none})"; fail=1; fi
 if grep -q "Received IPC: hello atom" qemu.log; then echo "IPC_OK"; else echo "IPC_MISSING (non-fatal — daemon RECV-cycle timing)"; fi
 if grep -q "spawned pid" qemu.log && [ "$(grep -c "hello from ATOM OS System" qemu.log)" -ge 2 ]; then echo "SPAWN_OK"; else echo "SPAWN_MISSING"; fail=1; fi
 if grep -q "REAP pid=" qemu.log; then echo "REAP_OK"; else echo "REAP_MISSING"; fail=1; fi

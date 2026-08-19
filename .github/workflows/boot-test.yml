@@ -50,6 +50,7 @@ jobs:
           git -C "$K" apply "$GITHUB_WORKSPACE/patches/0004-xmm-save-restore-in-interrupt-wrappers.patch"
           git -C "$K" apply "$GITHUB_WORKSPACE/patches/0005-sys-spawn-runtime-process-creation.patch"
           git -C "$K" apply "$GITHUB_WORKSPACE/patches/0006-reap-spawned-task-resources-on-exit.patch"
+          git -C "$K" apply "$GITHUB_WORKSPACE/patches/0007-free-exec-replaced-address-spaces.patch"
 
       - name: Build userspace programs
         run: |
@@ -155,8 +156,11 @@ jobs:
                   sendkey(k)
           time.sleep(2.5)
 
-          # Prove SYS_EXEC: run hello.elf (replaces shell).
-          for k in list("run hello.elf") + ["ret"]:
+          # Prove SYS_EXEC: run fieldmon.elf (replaces shell). Fieldmon is
+          # the exec target because it exercises the new root with field
+          # syscalls (10 observation rounds) right after EXECFREE released
+          # the shell's old address space (patch 0007).
+          for k in list("run fieldmon.elf") + ["ret"]:
               # space is qcode "spc", '.' is "dot"
               if k == " ":
                   sendkey("spc")
@@ -207,6 +211,8 @@ jobs:
             echo "RAMFS_MISSING"; fail=1
           fi
           if grep -q "hello from ATOM OS System" qemu.log; then
+            # hello prints via the two spawns above; the exec itself targets
+            # fieldmon (FIELD_EXEC_OK below) since patch 0007.
             echo "EXEC_OK"
           else
             echo "EXEC_MISSING"; fail=1
@@ -253,5 +259,20 @@ jobs:
             echo "LEAK_CLOSED (free_before=$before free_after_reap=$after)"
           else
             echo "LEAK_OPEN (free_before=${before:-none} free_after_reap=${after:-none})"; fail=1
+          fi
+          if grep -q "fieldmon: observing" qemu.log; then
+            echo "FIELD_EXEC_OK"
+          else
+            echo "FIELD_EXEC_MISSING"; fail=1
+          fi
+          # Patch 0007: EXEC must free the replaced address space. Expect
+          # >=8 frames (PML4 + 3 private-chain + image span >=1 + 2 user
+          # stack) and nothing deferred (no inherited RECV chains here).
+          efreed=$(grep -o "EXECFREE pid=[0-9]* freed=[0-9]*" qemu.log | head -1 | sed "s/.*freed=//")
+          edefer=$(grep -o "EXECFREE pid=[0-9]* freed=[0-9]* deferred=[0-9]*" qemu.log | head -1 | sed "s/.*deferred=//")
+          if [ -n "$efreed" ] && [ "$efreed" -ge 8 ] && [ "${edefer:-X}" = "0" ]; then
+            echo "EXECFREE_OK (freed=$efreed deferred=$edefer)"
+          else
+            echo "EXECFREE_BAD (freed=${efreed:-none} deferred=${edefer:-none})"; fail=1
           fi
           exit $fail

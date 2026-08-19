@@ -20,6 +20,7 @@ source workspace) and the kernel's own `ATOM-STACK-KERNEL-DESIGN.md`.
 | XMM liveness across syscalls/preemption | `xtest` probe: XMM_OK baseline/syscall/preempt×3 with patch 0004; same probe caught clobbers without it (2026-08-18) |
 | `spawn hello.elf` / SYS_SPAWN | `spawned pid 3`, hello prints, shell prompt returns; pid/slot reclaimed on second spawn; fieldmon spawns, runs 10 rounds, exits, shell survives (patch 0005; 2026-08-18) |
 | Reap of exited tasks' resources | Gates `REAP_OK` / `REAP_FRAMES_OK` / `LEAK_CLOSED`: a second spawn reaps the dead task's slot — 8 frames return (private page tables, kernel stack, image span, user stack) and the allocator free-count returns exactly to the spawning spawn's pre-allocation value; fieldmon reaps identically (patch 0006; 2026-08-19) |
+| Free of EXEC-replaced address spaces | Gates `EXECFREE_OK` / `FIELD_EXEC_OK`: `run fieldmon.elf` with two spawned children still holding the shell's root as baseline frees exactly 42 frames (PML4 + 3 private-chain + 36 image span + 2 user stack — matches the shell ELF's PT_LOAD span arithmetic), defers nothing, rebaselines the children, and fieldmon then runs 10 field rounds on the new root (patch 0007; 2026-08-19) |
 
 ## Layers
 
@@ -148,13 +149,30 @@ per-pid IPC RECV frames stay globally cached). Reap-at-reuse is the
 safe point: another task has run since the termination, so the dead
 CR3 is not loaded and nothing references the dead stack. Spawned
 kernel stacks come from the frame allocator instead of the kernel heap
-because the heap cannot free individual blocks. Address spaces
-REPLACED by `run`/EXEC still leak — their roots are never freed while
-other tasks may hold them as diff-walk baselines; that is the next
-candidate. Diagnostics: every successful spawn prints
-`SPAWN pid=N free_before=F` on serial and every reap prints
-`REAP pid=N freed=K free=F`; CI asserts `freed ≥ 8` and exact
-free-count equality across the reap window.
+because the heap cannot free individual blocks. Diagnostics: every
+successful spawn prints `SPAWN pid=N free_before=F` on serial and
+every reap prints `REAP pid=N freed=K free=F`; CI asserts `freed ≥ 8`
+and exact free-count equality across the reap window.
+
+Since patch 0007, address spaces REPLACED by `run`/EXEC are freed too,
+which closes the last loader leak. Two loader changes make this safe.
+First, `load_user_image` now zeroes the source's image PTEs in the
+fresh copy's private PT right after the unshare (both EXEC and SPAWN),
+so a new root holds no stale aliases into the source's image frames.
+Second, EXEC frees the replaced root with a three-part invariant:
+(1) every root copied from it already had those aliases cut; (2) tasks
+holding it as their diff-walk baseline are rebaselined to ITS parent
+first — sound because each such task replaced the only region where it
+differs (the image/stack chain) with its own private chain, so its
+diff-walk frees the identical frame set against either baseline; and
+(3) any private frame some other root still reaches (e.g. an inherited
+IPC RECV chain) is deferred, never freed. EXEC then prints
+`EXECFREE pid=N freed=K deferred=M`; CI asserts `freed ≥ 8` and
+`deferred == 0`. Known limit: if the shell ever RECVs, then spawns,
+then execs, such an inherited RECV chain can be freed later by a reap
+of the exec lineage; no current userspace program RECVs except the
+daemon, which never spawns or execs. With 0007 the loader allocates
+and frees cleanly — `spawn` churn and `run` both return their frames.
 
 ## Known userspace limitations
 
