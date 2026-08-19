@@ -44,6 +44,12 @@ verified correct.
    align-1, so FXSAVE cannot be used) and restore the resumed task's
    state before iretq. The kernel never touches MXCSR/AVX, so the XMM
    regs are the full user-visible SSE state.
+5. `patches/0005-sys-spawn-runtime-process-creation.patch` — SYS_SPAWN
+   (21): loads a RamFS ELF as a brand-new task (own pid, kernel stack,
+   trap frame, private address space) while the caller keeps running.
+   The EXEC image-loading code is extracted into `load_user_image` and
+   shared by both syscalls; the scheduler reclaims Terminated slots and
+   hands out the lowest free pid 1..15.
 
 These patches are not yet landed on `atom-os-kernel` itself (except the
 yield fix on HEAD); applying them here is the integration path.
@@ -138,5 +144,7 @@ edit <file>       append-only line editor ('.' saves; files >1024 B refused)
 echo <text> > <f> append text to file
 msg <text>        send IPC to daemon (pid 2) — see IPC caveat above
 run <file.elf>    exec REPLACES the shell
+spawn <file.elf>  run as a new process; shell stays alive
 bench             10,000 SYS_YIELD cycle count (also runs once at boot)
+xtest             XMM liveness probe (baseline/syscall/preempt)
 ```

@@ -1,0 +1,526 @@
+diff --git a/kernel-orchestrator/src/syscall.rs b/kernel-orchestrator/src/syscall.rs
+--- a/kernel-orchestrator/src/syscall.rs
++++ b/kernel-orchestrator/src/syscall.rs
+@@ -30,6 +30,10 @@
+ pub const SYS_FIELD_EVOLVE: u64 = 18;
+ pub const SYS_FIELD_OBSERVE: u64 = 19;
+ pub const SYS_FIELD_MEASUREMENTS: u64 = 20;
++/// 21: SYS_SPAWN  rdi=NUL-terminated path -> new pid or u64::MAX. Loads the
++/// ELF as a brand-new task (own kernel stack, trap frame, address space);
++/// the caller keeps running. Patch 0005.
++pub const SYS_SPAWN: u64 = 21;
+ 
+ 
+ /// Byte mailboxes for IPC: one single-slot box per pid, latest message wins.
+@@ -89,8 +93,138 @@
+     }
+ }
+ 
++/// Look up `filename` in the RamFS root and return a pointer to its data
++/// vector. The lock is released before return; RamFS nodes live for the
++/// whole boot, so the pointed-to Vec stays valid (same hazard class as the
++/// pre-existing EXEC path).
++fn ramfs_file_ptr(filename: &str) -> Option<*const alloc::vec::Vec<u8>> {
++    let fs = kernel_kit::fs::ROOT_FS.lock();
++    let mut found = None;
++    if let kernel_kit::fs::AtomNode::Directory(children) = &*fs {
++        for (name, node) in children {
++            if name == filename {
++                if let kernel_kit::fs::AtomNode::File(data) = node {
++                    found = Some(data as *const alloc::vec::Vec<u8>);
++                }
++                break;
++            }
++        }
++    }
++    kernel_kit::fs::ROOT_FS.unlock();
++    found
++}
++
++/// Load an ELF image into a fresh user address space derived from the
++/// ACTIVE CR3 (the kernel half stays shared). Returns (entry, new_pml4_phys)
++/// or None. Panics on frame-allocator OOM, matching the pre-existing EXEC
++/// behavior. Used by both SYS_EXEC (replace caller) and SYS_SPAWN (new task).
++fn load_user_image(elf_bytes: &[u8]) -> Option<(u64, u64)> {
++    if elf_bytes.len() < core::mem::size_of::<kernel_kit::elf::Elf64_Ehdr>() {
++        return None;
++    }
++    let ehdr_ptr = elf_bytes.as_ptr() as *const kernel_kit::elf::Elf64_Ehdr;
++    let ehdr = unsafe { &*ehdr_ptr };
++    if !ehdr.is_valid() {
++        return None;
++    }
++    let phoff = ehdr.e_phoff as usize;
++    let phnum = ehdr.e_phnum as usize;
++
++    let active_cr3 = kernel_kit::paging::Cr3::read();
++    let new_cr3 = match kernel_kit::paging::duplicate_pml4(active_cr3) {
++        Some(c) => c,
++        None => return None, // OOM duplicating PML4
++    };
++    // Private page-table path for user image + stack so
++    // map_segment does not mutate tables shared with the caller.
++    kernel_kit::paging::unshare_page_path(new_cr3, 0xFFFFFFFF80100000);
++    kernel_kit::paging::unshare_page_path(new_cr3, 0xFFFFFFFF800FE000);
++    // PASS 1: scan phdrs to find the virtual span [vmin, vmax).
++    let mut vmin: u64 = u64::MAX;
++    let mut vmax: u64 = 0;
++    for i in 0..phnum {
++        let phdr_ptr = unsafe { elf_bytes.as_ptr().add(phoff + i * core::mem::size_of::<kernel_kit::elf::Elf64_Phdr>()) as *const kernel_kit::elf::Elf64_Phdr };
++        let phdr = unsafe { &*phdr_ptr };
++        if phdr.p_type == 1 { // PT_LOAD
++            let v = phdr.p_vaddr;
++            let m = phdr.p_memsz;
++            if v < vmin { vmin = v; }
++            if v + m > vmax { vmax = v + m; }
++        }
++    }
++    // Allocate ONE contiguous run of frames covering the whole span,
++    // page-aligned (see patch 0002 for the boundary-page rationale).
++    let span_start_vaddr = vmin & !0xFFF;
++    let span_end_vaddr = (vmax + 0xFFF) & !0xFFF;
++    let span_bytes = (span_end_vaddr - span_start_vaddr) as usize;
++    let span_nframes = (span_bytes + 0xFFF) / 0x1000;
++    let span_phys = {
++        let (fa, sif) = kernel_kit::memory::FRAME_ALLOCATOR.lock();
++        let r = fa.alloc_contiguous(span_nframes);
++        kernel_kit::memory::FRAME_ALLOCATOR.unlock(sif);
++        match r {
++            Some(f) => f,
++            None => panic!("OOM (contig span) image load"),
++        }
++    };
++    // PASS 2: copy each PT_LOAD's bytes at its offset.
++    let span_virt = kernel_kit::paging::phys_to_virt(span_phys) as *mut u8;
++    for i in 0..phnum {
++        let phdr_ptr = unsafe { elf_bytes.as_ptr().add(phoff + i * core::mem::size_of::<kernel_kit::elf::Elf64_Phdr>()) as *const kernel_kit::elf::Elf64_Phdr };
++        let phdr = unsafe { &*phdr_ptr };
++        if phdr.p_type == 1 {
++            let vaddr = phdr.p_vaddr;
++            let offset = phdr.p_offset as usize;
++            let filesz = phdr.p_filesz as usize;
++            let memsz = phdr.p_memsz as usize;
++            let off_in_span = (vaddr - span_start_vaddr) as usize;
++            unsafe {
++                if filesz > 0 {
++                    core::ptr::copy_nonoverlapping(
++                        elf_bytes.as_ptr().add(offset),
++                        span_virt.add(off_in_span),
++                        filesz,
++                    );
++                }
++                if memsz > filesz {
++                    core::ptr::write_bytes(
++                        span_virt.add(off_in_span + filesz),
++                        0,
++                        memsz - filesz,
++                    );
++                }
++            }
++        }
++    }
++    // Map the whole span in one call. Each leaf PTE is written exactly
++    // once; no boundary-page overwrite.
++    kernel_kit::paging::map_segment(new_cr3, span_start_vaddr, span_phys, span_bytes);
++
++    // Map a fresh user stack (8 KiB ending at 0xFFFFFFFF80100000).
++    unsafe {
++        let stack_vaddr = 0xFFFFFFFF800FE000;
++        let stack_size = 8192;
++        let stack_phys = {
++            let (fa, sif) = kernel_kit::memory::FRAME_ALLOCATOR.lock();
++            let r = fa.alloc_contiguous(2); // 8 KiB = 2 frames
++            kernel_kit::memory::FRAME_ALLOCATOR.unlock(sif);
++            match r {
++                Some(f) => f,
++                None => panic!("OOM (contig 2) user stack"),
++            }
++        };
++        core::ptr::write_bytes(
++            kernel_kit::paging::phys_to_virt(stack_phys) as *mut u8,
++            0, stack_size,
++        );
++        kernel_kit::paging::map_segment(new_cr3, stack_vaddr, stack_phys, stack_size);
++    }
++
++    Some((ehdr.e_entry, new_cr3))
++}
++
+ /// The syscall dispatcher reads from the physical TrapFrame saved on the hardware stack.
+-pub fn dispatch(ctx: &mut Context, mem: &mut MemoryPool) {
++pub fn dispatch(ctx: &mut Context, mem: &mut MemoryPool, sched: &mut crate::scheduler::Scheduler) {
+     if ctx.rsp == 0 { return; } // Safety against uninitialized context
+     
+     let trap_frame = unsafe { &mut *(ctx.rsp as *mut TrapFrame) };
+@@ -253,173 +387,95 @@
+         }
+         let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
+         if let Ok(filename) = core::str::from_utf8(slice) {
+-            let fs = kernel_kit::fs::ROOT_FS.lock();
+-            if let kernel_kit::fs::AtomNode::Directory(children) = &*fs {
+-                let mut found_file = None;
+-                for (name, node) in children {
+-                    if name == filename {
+-                        if let kernel_kit::fs::AtomNode::File(data) = node {
+-                            found_file = Some(data as *const alloc::vec::Vec<u8>);
+-                        }
+-                        break;
++            if let Some(file_ptr) = ramfs_file_ptr(filename) {
++                let elf_bytes = unsafe { &*file_ptr }.as_slice();
++                if let Some((entry, new_cr3)) = load_user_image(elf_bytes) {
++                    // Context Switch setup: replace the caller's
++                    // address space AND reset the user trap frame so
++                    // iretq enters the new image at a clean ABI
++                    // state (fresh stack top, zeroed GPRs).
++                    trap_frame.rip = entry;
++                    trap_frame.rsp = 0xFFFFFFFF80100000;
++                    trap_frame.rflags = 0x202;
++                    trap_frame.cs = 0x1B;
++                    trap_frame.ss = 0x23;
++                    trap_frame.r15 = 0;
++                    trap_frame.r14 = 0;
++                    trap_frame.r13 = 0;
++                    trap_frame.r12 = 0;
++                    trap_frame.r11 = 0;
++                    trap_frame.r10 = 0;
++                    trap_frame.r9 = 0;
++                    trap_frame.r8 = 0;
++                    trap_frame.rbp = 0;
++                    trap_frame.rdi = 0;
++                    trap_frame.rsi = 0;
++                    trap_frame.rdx = 0;
++                    trap_frame.rcx = 0;
++                    trap_frame.rbx = 0;
++                    trap_frame.rax = 0;
++                    ctx.page_table_root = new_cr3;
++
++                    // Clean up file descriptors
++                    for i in 0..16 {
++                        ctx.open_files[i] = (0, 0);
+                     }
++                } else {
++                    trap_frame.rax = u64::MAX;
+                 }
+-                
+-                if let Some(file_ptr) = found_file {
+-                    kernel_kit::fs::ROOT_FS.unlock();
+-                    let data = unsafe { &*file_ptr };
+-                    let elf_bytes = data.as_slice();
+-                    
+-                    if elf_bytes.len() >= core::mem::size_of::<kernel_kit::elf::Elf64_Ehdr>() {
+-                        let ehdr_ptr = elf_bytes.as_ptr() as *const kernel_kit::elf::Elf64_Ehdr;
+-                        let ehdr = unsafe { &*ehdr_ptr };
+-                        
+-                        if ehdr.is_valid() {
+-                            let phoff = ehdr.e_phoff as usize;
+-                            let phnum = ehdr.e_phnum as usize;
+-                            
+-                            let active_cr3 = kernel_kit::paging::Cr3::read();
+-                            if let Some(new_cr3) = kernel_kit::paging::duplicate_pml4(active_cr3) {
+-                                // Private page-table path for user image + stack so
+-                                // map_segment does not mutate tables shared with the caller.
+-                                kernel_kit::paging::unshare_page_path(new_cr3, 0xFFFFFFFF80100000);
+-                                kernel_kit::paging::unshare_page_path(new_cr3, 0xFFFFFFFF800FE000);
+-                                // PASS 1: scan phdrs to find the virtual span [vmin, vmax).
+-                            let mut vmin: u64 = u64::MAX;
+-                            let mut vmax: u64 = 0;
+-                            for i in 0..phnum {
+-                                let phdr_ptr = unsafe { elf_bytes.as_ptr().add(phoff + i * core::mem::size_of::<kernel_kit::elf::Elf64_Phdr>()) as *const kernel_kit::elf::Elf64_Phdr };
+-                                let phdr = unsafe { &*phdr_ptr };
+-                                if phdr.p_type == 1 { // PT_LOAD
+-                                    let v = phdr.p_vaddr;
+-                                    let m = phdr.p_memsz;
+-                                    if v < vmin { vmin = v; }
+-                                    if v + m > vmax { vmax = v + m; }
+-                                }
+-                            }
+-                            // Allocate ONE contiguous run of frames covering the
+-                            // whole span, page-aligned. This avoids the bug where
+-                            // two PT_LOADs share a boundary page (e.g. .text ends
+-                            // at 0x801024c5, .rodata starts at 0x801024d0, both
+-                            // in page 0x80102000-0x80103000). Mapping them
+-                            // separately overwrites the leaf PTE for the shared
+-                            // page; mapping the whole span with one call writes
+-                            // each leaf PTE exactly once.
+-                            let span_start_vaddr = vmin & !0xFFF;
+-                            let span_end_vaddr = (vmax + 0xFFF) & !0xFFF;
+-                            let span_bytes = (span_end_vaddr - span_start_vaddr) as usize;
+-                            let span_nframes = (span_bytes + 0xFFF) / 0x1000;
+-                            let span_phys = {
+-                                let (fa, sif) = kernel_kit::memory::FRAME_ALLOCATOR.lock();
+-                                let r = fa.alloc_contiguous(span_nframes);
+-                                kernel_kit::memory::FRAME_ALLOCATOR.unlock(sif);
+-                                match r {
+-                                    Some(f) => f,
+-                                    None => panic!("OOM (contig span) SYS_EXEC"),
+-                                }
+-                            };
+-                            // PASS 2: copy each PT_LOAD's bytes at its offset.
+-                            let span_virt = kernel_kit::paging::phys_to_virt(span_phys) as *mut u8;
+-                            for i in 0..phnum {
+-                                let phdr_ptr = unsafe { elf_bytes.as_ptr().add(phoff + i * core::mem::size_of::<kernel_kit::elf::Elf64_Phdr>()) as *const kernel_kit::elf::Elf64_Phdr };
+-                                let phdr = unsafe { &*phdr_ptr };
+-                                if phdr.p_type == 1 {
+-                                    let vaddr = phdr.p_vaddr;
+-                                    let offset = phdr.p_offset as usize;
+-                                    let filesz = phdr.p_filesz as usize;
+-                                    let memsz = phdr.p_memsz as usize;
+-                                    let off_in_span = (vaddr - span_start_vaddr) as usize;
+-                                    unsafe {
+-                                        if filesz > 0 {
+-                                            core::ptr::copy_nonoverlapping(
+-                                                elf_bytes.as_ptr().add(offset),
+-                                                span_virt.add(off_in_span),
+-                                                filesz,
+-                                            );
+-                                        }
+-                                        if memsz > filesz {
+-                                            core::ptr::write_bytes(
+-                                                span_virt.add(off_in_span + filesz),
+-                                                0,
+-                                                memsz - filesz,
+-                                            );
+-                                        }
+-                                    }
+-                                }
+-                            }
+-                            // Map the whole span in one call. Each leaf PTE is
+-                            // written exactly once; no boundary-page overwrite.
+-                            kernel_kit::paging::map_segment(
+-                                new_cr3, span_start_vaddr, span_phys, span_bytes,
+-                            );
+-
+-                                // Map User Stack (8KB ending at 0xFFFFFFFF80100000)
+-                                unsafe {
+-                                    let stack_vaddr = 0xFFFFFFFF800FE000;
+-                                    let stack_size = 8192;
+-                                    // Use a CONTIGUOUS run of frames for the user stack — same
+-                                    // reason as PT_LOAD: map_segment assumes phys_base + i*4K.
+-                                    let stack_phys = {
+-                                        let (fa, sif) = kernel_kit::memory::FRAME_ALLOCATOR.lock();
+-                                        let r = fa.alloc_contiguous(2); // 8 KiB = 2 frames
+-                                        kernel_kit::memory::FRAME_ALLOCATOR.unlock(sif);
+-                                        match r {
+-                                            Some(f) => f,
+-                                            None => panic!("OOM (contig 2) user stack"),
+-                                        }
+-                                    };
+-                                    core::ptr::write_bytes(
+-                                        kernel_kit::paging::phys_to_virt(stack_phys) as *mut u8,
+-                                        0, stack_size,
+-                                    );
+-                                    kernel_kit::paging::map_segment(new_cr3, stack_vaddr, stack_phys, stack_size);
+-                                }
+-                                // Context Switch setup: replace the caller's
+-                                // address space AND reset the user trap frame so
+-                                // iretq enters the new image at a clean ABI
+-                                // state (fresh stack top, zeroed GPRs).
+-                                trap_frame.rip = ehdr.e_entry;
+-                                trap_frame.rsp = 0xFFFFFFFF80100000;
+-                                trap_frame.rflags = 0x202;
+-                                trap_frame.cs = 0x1B;
+-                                trap_frame.ss = 0x23;
+-                                trap_frame.r15 = 0;
+-                                trap_frame.r14 = 0;
+-                                trap_frame.r13 = 0;
+-                                trap_frame.r12 = 0;
+-                                trap_frame.r11 = 0;
+-                                trap_frame.r10 = 0;
+-                                trap_frame.r9 = 0;
+-                                trap_frame.r8 = 0;
+-                                trap_frame.rbp = 0;
+-                                trap_frame.rdi = 0;
+-                                trap_frame.rsi = 0;
+-                                trap_frame.rdx = 0;
+-                                trap_frame.rcx = 0;
+-                                trap_frame.rbx = 0;
+-                                trap_frame.rax = 0;
+-                                ctx.page_table_root = new_cr3;
+-                                
+-                                // Clean up file descriptors
+-                                for i in 0..16 {
+-                                    ctx.open_files[i] = (0, 0);
+-                                }
+-                            } else {
+-                                trap_frame.rax = u64::MAX; // OOM duplicating PML4
+-                            }
+-                        } else {
+-                            trap_frame.rax = u64::MAX;
++            } else {
++                trap_frame.rax = u64::MAX;
++            }
++        } else {
++            trap_frame.rax = u64::MAX;
++        }
++    } else if compare(&sys_num, &(SYS_SPAWN + 1)) && !compare(&sys_num, &SYS_SPAWN) {
++        // SYS_SPAWN: load the ELF as a NEW task — own kernel stack, trap
++        // frame, and private address space — and hand it to the scheduler.
++        // The caller keeps running. Returns the new pid or u64::MAX.
++        let ptr = arg as *const u8;
++        let mut len = 0;
++        unsafe {
++            while *ptr.add(len) != 0 {
++                len += 1;
++            }
++        }
++        let slice = unsafe { core::slice::from_raw_parts(ptr, len) };
++        if let Ok(filename) = core::str::from_utf8(slice) {
++            if let Some(pid) = sched.alloc_pid() {
++                if let Some(file_ptr) = ramfs_file_ptr(filename) {
++                    let elf_bytes = unsafe { &*file_ptr }.as_slice();
++                    if let Some((entry, new_cr3)) = load_user_image(elf_bytes) {
++                        // Kernel stack for the new task's trap frames.
++                        let mut kernel_stack = alloc::vec::Vec::<u8>::with_capacity(4096);
++                        kernel_stack.resize(4096, 0);
++                        let kernel_stack_top = kernel_stack.as_ptr() as u64 + 4096;
++                        core::mem::forget(kernel_stack);
++
++                        let tf = kernel_kit::trap::TrapFrame::new_user(entry, 0xFFFFFFFF80100000);
++                        let frame_ptr = (kernel_stack_top
++                            - core::mem::size_of::<kernel_kit::trap::TrapFrame>() as u64)
++                            as *mut kernel_kit::trap::TrapFrame;
++                        unsafe { *frame_ptr = tf; }
++
++                        let new_ctx = kernel_kit::context::Context::new(
++                            pid,
++                            frame_ptr as u64,
++                            kernel_stack_top,
++                            new_cr3,
++                        );
++                        match sched.spawn(new_ctx) {
++                            Ok(()) => trap_frame.rax = pid as u64,
++                            Err(()) => trap_frame.rax = u64::MAX,
+                         }
+                     } else {
+                         trap_frame.rax = u64::MAX;
+                     }
+                 } else {
+-                    kernel_kit::fs::ROOT_FS.unlock();
+                     trap_frame.rax = u64::MAX;
+                 }
+             } else {
+-                kernel_kit::fs::ROOT_FS.unlock();
+-                trap_frame.rax = u64::MAX;
++                trap_frame.rax = u64::MAX; // no free pid
+             }
+         } else {
+             trap_frame.rax = u64::MAX;
+diff --git a/kernel-orchestrator/src/scheduler.rs b/kernel-orchestrator/src/scheduler.rs
+--- a/kernel-orchestrator/src/scheduler.rs
++++ b/kernel-orchestrator/src/scheduler.rs
+@@ -25,10 +25,15 @@
+         self.tasks[self.current_task].as_mut()
+     }
+ 
+-    /// Spawns a new task.
++    /// Spawns a new task. Terminated slots are reusable (patch 0005) so
++    /// short-lived spawned programs do not exhaust the task table.
+     pub fn spawn(&mut self, ctx: Context) -> Result<(), ()> {
+         for i in 0..MAX_TASKS {
+-            if self.tasks[i].is_none() {
++            let free = match &self.tasks[i] {
++                None => true,
++                Some(t) => t.state == TaskState::Terminated,
++            };
++            if free {
+                 self.tasks[i] = Some(ctx);
+                 return Ok(());
+             }
+@@ -36,6 +41,21 @@
+         Err(())
+     }
+ 
++    /// Lowest pid in 1..MAX_TASKS not held by a live (non-terminated) task.
++    /// Reused pids inherit their old field-site history — acceptable at this
++    /// stage, documented in the userspace ARCHITECTURE notes.
++    pub fn alloc_pid(&self) -> Option<usize> {
++        for candidate in 1..MAX_TASKS {
++            let taken = self.tasks.iter().any(|t| {
++                matches!(t, Some(c) if c.id == candidate && c.state != TaskState::Terminated)
++            });
++            if !taken {
++                return Some(candidate);
++            }
++        }
++        None
++    }
++
+     /// Called by the Timer Interrupt. Takes the interrupted task's stack pointer,
+     /// saves the full TrapFrame, and returns the next task's stack pointer.
+     pub fn switch_context(&mut self, old_rsp: u64) -> u64 {
+diff --git a/x86_64-kernel/src/main.rs b/x86_64-kernel/src/main.rs
+--- a/x86_64-kernel/src/main.rs
++++ b/x86_64-kernel/src/main.rs
+@@ -515,7 +515,13 @@
+     
+     unsafe {
+         if let Some(sys) = &mut *(&raw mut SYSTEM) {
+-            if let Some(task) = sys.scheduler.current_task_mut() {
++            // SYS_SPAWN hands the scheduler to dispatch, so the current
++            // task is held as a raw pointer to keep the borrows disjoint.
++            let task_ptr = match sys.scheduler.current_task_mut() {
++                Some(t) => t as *mut kernel_kit::context::Context,
++                None => core::ptr::null_mut(),
++            };
++            if !task_ptr.is_null() {
+                 // Read the syscall number from the trap frame on the stack.
+                 // Do NOT save task.rsp here — only the timer handler owns
+                 // task.rsp for context switching. Overwriting it here
+@@ -523,14 +529,16 @@
+                 let frame_ptr = rsp as *mut kernel_kit::trap::TrapFrame;
+                 let sys_num = (*frame_ptr).rax;
+                 let mut mem = kernel_kit::memory::MemoryPool::new();
+-                kernel_orchestrator::syscall::dispatch(task, &mut mem);
++                kernel_orchestrator::syscall::dispatch(
++                    &mut *task_ptr, &mut mem, &mut sys.scheduler,
++                );
+                 // Return the SAME rsp — the syscall didn't switch stacks.
+                 new_rsp = rsp;
+ 
+                 // Only SYS_YIELD (1) and SYS_EXIT (3) trigger a context switch.
+                 let did_switch = if sys_num == 1 || sys_num == 3 {
+                     // NOW it's safe to save the task's rsp for the switch.
+-                    task.rsp = rsp;
++                    (*task_ptr).rsp = rsp;
+                     new_rsp = sys.scheduler.switch_context(rsp);
+                     true
+                 } else {
+@@ -571,16 +579,22 @@
+ 
+     unsafe {
+         if let Some(sys) = &mut *(&raw mut SYSTEM) {
+-            if let Some(task) = sys.scheduler.current_task_mut() {
++            let task_ptr = match sys.scheduler.current_task_mut() {
++                Some(t) => t as *mut kernel_kit::context::Context,
++                None => core::ptr::null_mut(),
++            };
++            if !task_ptr.is_null() {
+                 let frame_ptr = rsp as *mut kernel_kit::trap::TrapFrame;
+                 let sys_num = (*frame_ptr).rax;
+                 let mut mem = kernel_kit::memory::MemoryPool::new();
+ 
+-                kernel_orchestrator::syscall::dispatch(task, &mut mem);
++                kernel_orchestrator::syscall::dispatch(
++                    &mut *task_ptr, &mut mem, &mut sys.scheduler,
++                );
+                 new_rsp = rsp;
+ 
+                 if sys_num == 1 || sys_num == 3 {
+-                    task.rsp = rsp;
++                    (*task_ptr).rsp = rsp;
+                     new_rsp = sys.scheduler.switch_context(rsp);
+                 }
+             }
+@@ -700,7 +714,11 @@
+     tf.rax = 13; // SYS_EXEC
+     tf.rdi = filename.as_ptr() as u64;
+     
+-    kernel_orchestrator::syscall::dispatch(&mut ctx, &mut mem);
++    if let Some(sys) = &mut *(&raw mut SYSTEM) {
++        kernel_orchestrator::syscall::dispatch(&mut ctx, &mut mem, &mut sys.scheduler);
++    } else {
++        panic!("SYSTEM not initialized before spawn_process");
++    }
+     
+     if tf.rax == core::u64::MAX {
+         panic!("Failed to load payload");

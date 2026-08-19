@@ -16,6 +16,9 @@ pub const SYS_EXEC: u64 = 13;
 pub const SYS_PRINT: u64 = 14;
 pub const SYS_IPC_SEND: u64 = 15;
 pub const SYS_IPC_RECV: u64 = 16;
+/// SYS_SPAWN — load the ELF as a NEW task; caller keeps running
+/// (requires kernel patch 0005).
+pub const SYS_SPAWN: u64 = 21;
 pub const SYS_FIELD_STIMULATE: u64 = 17;
 pub const SYS_FIELD_EVOLVE: u64 = 18;
 pub const SYS_FIELD_OBSERVE: u64 = 19;
@@ -144,6 +147,19 @@ pub fn exec(path: &[u8]) -> bool {
         return false;
     };
     (unsafe { syscall1(SYS_EXEC, buf.as_ptr() as u64) }) != u64::MAX
+}
+
+/// SYS_SPAWN — run the ELF as a new process (own pid, kernel stack, and
+/// address space). Returns the new pid, or `None` on failure. The caller
+/// keeps running, unlike [`exec`].
+pub fn spawn(path: &[u8]) -> Option<u64> {
+    let Some(buf) = copy_nul::<64>(path) else {
+        return None;
+    };
+    match unsafe { syscall1(SYS_SPAWN, buf.as_ptr() as u64) } {
+        u64::MAX => None,
+        pid => Some(pid),
+    }
 }
 
 pub fn ipc_send(target_pid: u64, msg: &[u8]) -> bool {

@@ -23,6 +23,7 @@ git -C atom-os-kernel apply "$SYSROOT/patches/0001-int80-yield-use-switch-result
 git -C atom-os-kernel apply "$SYSROOT/patches/0002-exec-reset-cr3-and-inject-extra-elfs.patch"
 git -C atom-os-kernel apply "$SYSROOT/patches/0003-ipc-byte-mailboxes-and-frame-recv-pages.patch"
 git -C atom-os-kernel apply "$SYSROOT/patches/0004-xmm-save-restore-in-interrupt-wrappers.patch"
+git -C atom-os-kernel apply "$SYSROOT/patches/0005-sys-spawn-runtime-process-creation.patch"
 
 for p in hello daemon shell fieldmon; do
     (cd "$SYSROOT/programs/$p" && cargo +nightly build -Zjson-target-spec --release --quiet)
@@ -87,6 +88,14 @@ for k in list("msg hello atom") + ["ret"]:
     else:
         sendkey(k)
 time.sleep(2.5)
+for k in list("spawn hello.elf") + ["ret"]:
+    if k == " ":
+        sendkey("spc")
+    elif k == ".":
+        sendkey("dot")
+    else:
+        sendkey(k)
+time.sleep(2.5)
 for k in list("run hello.elf") + ["ret"]:
     if k == " ":
         sendkey("spc")
@@ -114,4 +123,5 @@ if grep -q "commands:" qemu.log; then echo "KEYBOARD_OK"; else echo "KEYBOARD_MI
 if grep -q "hello.elf" qemu.log && grep -q "fieldmon.elf" qemu.log; then echo "RAMFS_OK"; else echo "RAMFS_MISSING"; fail=1; fi
 if grep -q "hello from ATOM OS System" qemu.log; then echo "EXEC_OK"; else echo "EXEC_MISSING"; fail=1; fi
 if grep -q "Received IPC: hello atom" qemu.log; then echo "IPC_OK"; else echo "IPC_MISSING (non-fatal — daemon RECV-cycle timing)"; fi
+if grep -q "spawned pid" qemu.log && [ "$(grep -c "hello from ATOM OS System" qemu.log)" -ge 2 ]; then echo "SPAWN_OK"; else echo "SPAWN_MISSING"; fail=1; fi
 [ "$fail" = 0 ] && echo "RUNTIME_SMOKE_PASS" || { echo "RUNTIME_SMOKE_FAIL"; exit 1; }

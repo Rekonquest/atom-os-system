@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use atom_rt::shell_parse::{tokens, trim};
 use atom_rt::{io, sys};
 
-const HELP: &str = "commands:\n  help              show this text\n  ls                list files\n  clear             clear screen\n  cat <file>        print file\n  edit <file>       line editor ('.' on its own line saves)\n  echo <text> > <f> append text to file\n  msg <text>        send IPC to daemon (pid 2)\n  run <file.elf>    exec a program from the RamFS\n  bench             10,000 SYS_YIELD cycle count\n  xtest             XMM liveness probe (baseline/syscall/preempt)\n";
+const HELP: &str = "commands:\n  help              show this text\n  ls                list files\n  clear             clear screen\n  cat <file>        print file\n  edit <file>       line editor ('.' on its own line saves)\n  echo <text> > <f> append text to file\n  msg <text>        send IPC to daemon (pid 2)\n  run <file.elf>    exec a program from the RamFS (replaces shell)\n  spawn <file.elf>  run a program as a new process (shell stays)\n  bench             10,000 SYS_YIELD cycle count\n  xtest             XMM liveness probe (baseline/syscall/preempt)\n";
 
 fn prompt() {
     io::print("> ");
@@ -81,6 +81,17 @@ fn cmd_bench() {
 fn cmd_run(name: &[u8]) {
     if !sys::exec(name) {
         io::print("exec failed\n");
+    }
+}
+
+fn cmd_spawn(name: &[u8]) {
+    match sys::spawn(name) {
+        Some(pid) => {
+            io::print("spawned pid ");
+            io::print_u64(pid);
+            io::print("\n");
+        }
+        None => io::print("spawn failed\n"),
     }
 }
 
@@ -249,6 +260,10 @@ fn main() -> ! {
             b"run" => match t.next() {
                 Some(name) => cmd_run(name),
                 None => io::print("usage: run <file.elf>\n"),
+            },
+            b"spawn" => match t.next() {
+                Some(name) => cmd_spawn(name),
+                None => io::print("usage: spawn <file.elf>\n"),
             },
             b"xtest" => cmd_xtest(),
             _ => io::print("Unknown command\n"),

@@ -48,6 +48,7 @@ jobs:
           git -C "$K" apply "$GITHUB_WORKSPACE/patches/0002-exec-reset-cr3-and-inject-extra-elfs.patch"
           git -C "$K" apply "$GITHUB_WORKSPACE/patches/0003-ipc-byte-mailboxes-and-frame-recv-pages.patch"
           git -C "$K" apply "$GITHUB_WORKSPACE/patches/0004-xmm-save-restore-in-interrupt-wrappers.patch"
+          git -C "$K" apply "$GITHUB_WORKSPACE/patches/0005-sys-spawn-runtime-process-creation.patch"
 
       - name: Build userspace programs
         run: |
@@ -130,6 +131,16 @@ jobs:
                   sendkey(k)
           time.sleep(2.5)
 
+          # Prove SYS_SPAWN: new process runs while the shell stays alive.
+          for k in list("spawn hello.elf") + ["ret"]:
+              if k == " ":
+                  sendkey("spc")
+              elif k == ".":
+                  sendkey("dot")
+              else:
+                  sendkey(k)
+          time.sleep(2.5)
+
           # Prove SYS_EXEC: run hello.elf (replaces shell).
           for k in list("run hello.elf") + ["ret"]:
               # space is qcode "spc", '.' is "dot"
@@ -192,5 +203,13 @@ jobs:
             # Byte delivery depends on the daemon's RECV cycle (500k yields)
             # landing inside the window; TCG runners can be too slow for it.
             echo "IPC_MISSING (non-fatal — daemon RECV-cycle timing)"
+          fi
+          if grep -q "spawned pid" qemu.log \
+             && [ "$(grep -c "hello from ATOM OS System" qemu.log)" -ge 2 ]; then
+            # "spawned pid" + hello printed twice: once by the spawned
+            # process (shell still alive) and once by the final `run`.
+            echo "SPAWN_OK"
+          else
+            echo "SPAWN_MISSING"; fail=1
           fi
           exit $fail

@@ -18,6 +18,7 @@ source workspace) and the kernel's own `ATOM-STACK-KERNEL-DESIGN.md`.
 | IPC byte delivery (`msg hello atom`) | QEMU QMP keys → `[Daemon] Received IPC: hello atom` (requires patch 0003; 2026-08-18) |
 | `run fieldmon.elf` field observation | 10 observe rounds print, clean exit, daemon survives (2026-08-18) |
 | XMM liveness across syscalls/preemption | `xtest` probe: XMM_OK baseline/syscall/preempt×3 with patch 0004; same probe caught clobbers without it (2026-08-18) |
+| `spawn hello.elf` / SYS_SPAWN | `spawned pid 3`, hello prints, shell prompt returns; pid/slot reclaimed on second spawn; fieldmon spawns, runs 10 rounds, exits, shell survives (patch 0005; 2026-08-18) |
 
 ## Layers
 
@@ -66,6 +67,7 @@ xmm0 on both the syscall and preemption paths; after, baseline,
 | 14 | PRINT | rdi=byte | serial only, 0 |
 | 15 | IPC_SEND | rdi=target pid, rsi=NUL-terminated msg | 0 or u64::MAX |
 | 16 | IPC_RECV | — | 0 (nothing) or RECV-page vaddr (0x00007F0000000000 since patch 0003) |
+| 21 | SPAWN | rdi=NUL-terminated path | new pid or u64::MAX (patch 0005; caller keeps running) |
 | 17 | FIELD_STIMULATE | rdi=pid, rsi=f32 magnitude bits | 0 or u64::MAX |
 | 18 | FIELD_EVOLVE | rdi=moments | new field age |
 | 19 | FIELD_OBSERVE | rdi=pid | trace-peak delta, f32 bits |
@@ -123,6 +125,17 @@ install + rebuild. With patch 0002, RamFS also contains `hello.elf` and
 `run` replaces the shell permanently. Patch 0002 resets the user trap
 frame (`rsp` to the stack top, zeroed GPRs) and loads the new CR3 on
 the syscall return path so runtime `run` matches the initial spawn ABI.
+
+Since patch 0005, `SYS_SPAWN` (21) loads a RamFS ELF as a brand-new
+task — own pid, 4 KiB kernel stack, fresh trap frame, private address
+space built from the active CR3 — and hands it to the scheduler; the
+caller keeps running (`spawn` in the shell). EXEC and SPAWN share the
+`load_user_image` loader. The scheduler reclaims Terminated task slots
+and `alloc_pid` hands out the lowest free pid 1..15, so short-lived
+spawns do not exhaust the table; a reused pid inherits its old
+field-site history (accepted, documented here). The spawned program's
+kernel stack and image frames are not freed on exit (documented leak,
+bounded by use).
 
 ## Known userspace limitations
 
