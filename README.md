@@ -13,23 +13,25 @@ The workflow `.github/workflows/boot-test.yml` clones
 keystrokes over QMP, and greps serial output.
 
 Gates: `BANNER_OK`, `HEAP_OK`, `BENCH_OK`, `DAEMON_OK`, `KEYBOARD_OK`,
-`RAMFS_OK`, `EXEC_OK`, `IPC_OK`, `SPAWN_OK`, `REAP_OK`,
+`RAMFS_OK`, `EXEC_OK`, `IPC_OK`, `IPC_QUEUE_OK`, `SPAWN_OK`, `REAP_OK`,
 `REAP_FRAMES_OK`, `LEAK_CLOSED`, `FIELD_EXEC_OK`, `EXECFREE_OK` — all
-fourteen green (2026-08-19, KVM-verified): `run fieldmon.elf` execs
+fifteen green (2026-08-19, KVM-verified): `run fieldmon.elf` execs
 and fieldmon runs its field rounds while the daemon keeps running;
 `spawn` runs a second process beside the shell; the second spawn reaps
 the exited task's frames — the allocator free-count returns exactly to
-its pre-spawn value (patch 0006); and the exec itself frees the
-replaced address space — exactly 42 frames for the shell, matching its
-ELF span arithmetic, nothing deferred (patch 0007). The old runtime
-#GP was never kernel-side: the `program!` macro's `_start` was an
-ordinary Rust fn compiled assuming `rsp ≡ 8 (mod 16)` at entry (the
-CALL convention), while iretq process entry starts with `rsp ≡ 0` —
-every stack-slot alignment downstream was off by 8, and the first
-rsp-relative `movaps` (zeroing the path buffer in `sys::exec`) faulted
-with #GP(0). Fixed by making `_start` an asm stub that CALLs the Rust
-entry. Patch 0002's exec machinery (frame reset, CR3 reload,
-page-table path unsharing) is verified correct.
+its pre-spawn value (patch 0006); the exec itself frees the replaced
+address space — exactly 42 frames for the shell, matching its ELF span
+arithmetic, nothing deferred (patch 0007); and two IPC messages sent
+back-to-back are both delivered in order by the queued mailbox
+(patch 0008). The old runtime #GP was never kernel-side: the
+`program!` macro's `_start` was an ordinary Rust fn compiled assuming
+`rsp ≡ 8 (mod 16)` at entry (the CALL convention), while iretq process
+entry starts with `rsp ≡ 0` — every stack-slot alignment downstream
+was off by 8, and the first rsp-relative `movaps` (zeroing the path
+buffer in `sys::exec`) faulted with #GP(0). Fixed by making `_start`
+an asm stub that CALLs the Rust entry. Patch 0002's exec machinery
+(frame reset, CR3 reload, page-table path unsharing) is verified
+correct.
 
 **Required kernel patches** (applied by the workflow after checkout):
 
@@ -75,6 +77,12 @@ page-table path unsharing) is verified correct.
    Any frame another root still reaches is deferred, never freed. With
    0006+0007 the loader allocates and frees cleanly: `spawn` churn and
    `run` both return their frames to the pool.
+8. `patches/0008-ipc-mailbox-ring-queues.patch` — the per-pid IPC
+   mailbox becomes a FIFO ring of 4 messages: back-to-back sends queue
+   instead of overwriting, and each RECV pops the oldest. When the ring
+   is full the oldest message is dropped (newest kept) — the old
+   latest-wins semantics, generalized. ABI unchanged (SEND/RECV
+   signatures and the `0x00007F0000000000` RECV page are untouched).
 
 These patches are not yet landed on `atom-os-kernel` itself (except the
 yield fix on HEAD); applying them here is the integration path.

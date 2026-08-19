@@ -21,6 +21,7 @@ source workspace) and the kernel's own `ATOM-STACK-KERNEL-DESIGN.md`.
 | `spawn hello.elf` / SYS_SPAWN | `spawned pid 3`, hello prints, shell prompt returns; pid/slot reclaimed on second spawn; fieldmon spawns, runs 10 rounds, exits, shell survives (patch 0005; 2026-08-18) |
 | Reap of exited tasks' resources | Gates `REAP_OK` / `REAP_FRAMES_OK` / `LEAK_CLOSED`: a second spawn reaps the dead task's slot — 8 frames return (private page tables, kernel stack, image span, user stack) and the allocator free-count returns exactly to the spawning spawn's pre-allocation value; fieldmon reaps identically (patch 0006; 2026-08-19) |
 | Free of EXEC-replaced address spaces | Gates `EXECFREE_OK` / `FIELD_EXEC_OK`: `run fieldmon.elf` with two spawned children still holding the shell's root as baseline frees exactly 42 frames (PML4 + 3 private-chain + 36 image span + 2 user stack — matches the shell ELF's PT_LOAD span arithmetic), defers nothing, rebaselines the children, and fieldmon then runs 10 field rounds on the new root (patch 0007; 2026-08-19) |
+| IPC mailbox queueing | Gate `IPC_QUEUE_OK`: two messages sent back-to-back (both in the daemon's mailbox before its next RECV cycle) are both delivered, in order — `Received IPC: alpha one` then `Received IPC: beta two` in the focused run; the pre-0008 single-slot mailbox lost the first (patch 0008; 2026-08-19) |
 
 ## Layers
 
@@ -78,11 +79,16 @@ xmm0 on both the syscall and preemption paths; after, baseline,
 ### IPC is dual transport: bytes plus field energy
 
 Since patch 0003, SYS_IPC_SEND delivers the message bytes to a per-pid
-single-slot mailbox (latest wins) AND injects `len * 0.02` energy into
-the field (the energy transport is unchanged). SYS_IPC_RECV returns the
-mailbox bytes when present; otherwise it falls back to the field
-radiation path, which encodes the magnitude `delta as u64` as ASCII —
-the fractional part is truncated, so energy-only signals render as `0`.
+mailbox AND injects `len * 0.02` energy into the field (the energy
+transport is unchanged). Since patch 0008 that mailbox is a FIFO ring
+of up to 4 messages: back-to-back sends queue instead of overwriting,
+and each SYS_IPC_RECV pops the oldest. When the ring is full the OLDEST
+message is dropped (newest kept) — a deliberate generalization of the
+old single-slot latest-wins behavior, so a slow receiver never loses
+the freshest traffic. SYS_IPC_RECV returns the mailbox bytes when
+present; otherwise it falls back to the field radiation path, which
+encodes the magnitude `delta as u64` as ASCII — the fractional part is
+truncated, so energy-only signals render as `0`.
 The RECV payload lands in a per-pid cached frame mapped at
 `0x00007F0000000000` (one frame per pid, reused — no leak). The
 historical `0x300000` address is retired: its PML4[0] chain comes from

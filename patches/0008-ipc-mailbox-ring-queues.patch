@@ -1,0 +1,118 @@
+diff --git a/kernel-orchestrator/src/syscall.rs b/kernel-orchestrator/src/syscall.rs
+index a3c7bc1..7a13f55 100644
+--- a/kernel-orchestrator/src/syscall.rs
++++ b/kernel-orchestrator/src/syscall.rs
+@@ -36,21 +36,68 @@ pub const SYS_FIELD_MEASUREMENTS: u64 = 20;
+ pub const SYS_SPAWN: u64 = 21;
+ 
+ 
+-/// Byte mailboxes for IPC: one single-slot box per pid, latest message wins.
+-/// Runs ALONGSIDE the field's energy transport (which stays untouched) so
+-/// SYS_IPC_SEND/RECV deliver actual message bytes again.
++/// Byte mailboxes for IPC: a small FIFO ring of messages per pid (patch
++/// 0008). Replaces the earlier single-slot box where a second message
++/// before the daemon's next RECV silently overwrote the first. Runs
++/// ALONGSIDE the field's energy transport (which stays untouched) so
++/// SYS_IPC_SEND/RECV deliver actual message bytes.
+ const IPC_MAX_PIDS: usize = 16;
+ const IPC_MAX_BYTES: usize = 255;
++/// Messages queued per pid before the oldest is dropped. 4 is enough for
++/// bursty command-driven IPC while keeping the static footprint small
++/// (16 pids x 4 x 255 B ~= 16 KiB).
++const IPC_QUEUE_DEPTH: usize = 4;
+ 
+ #[derive(Clone, Copy)]
+ struct IpcMailbox {
+-    len: usize,
+-    bytes: [u8; IPC_MAX_BYTES],
++    /// Number of queued messages (0..=IPC_QUEUE_DEPTH).
++    count: usize,
++    /// Slot index of the OLDEST queued message (ring head).
++    head: usize,
++    lens: [usize; IPC_QUEUE_DEPTH],
++    bytes: [[u8; IPC_MAX_BYTES]; IPC_QUEUE_DEPTH],
+ }
+ 
+ impl IpcMailbox {
+     const fn new() -> Self {
+-        Self { len: 0, bytes: [0u8; IPC_MAX_BYTES] }
++        Self {
++            count: 0,
++            head: 0,
++            lens: [0; IPC_QUEUE_DEPTH],
++            bytes: [[0u8; IPC_MAX_BYTES]; IPC_QUEUE_DEPTH],
++        }
++    }
++
++    /// Enqueue one message. When the ring is full the OLDEST message is
++    /// dropped (newest kept) — a deliberate generalization of the old
++    /// latest-wins semantics, so a slow receiver never loses the freshest
++    /// traffic.
++    fn push(&mut self, msg: &[u8]) {
++        if self.count == IPC_QUEUE_DEPTH {
++            self.head = (self.head + 1) % IPC_QUEUE_DEPTH;
++            self.count -= 1;
++        }
++        let idx = (self.head + self.count) % IPC_QUEUE_DEPTH;
++        let n = msg.len().min(IPC_MAX_BYTES);
++        for i in 0..n {
++            self.bytes[idx][i] = msg[i];
++        }
++        self.lens[idx] = n;
++        self.count += 1;
++    }
++
++    /// Dequeue the oldest message into `out`, returning its length, or
++    /// None if the queue is empty.
++    fn pop(&mut self, out: &mut [u8; IPC_MAX_BYTES]) -> Option<usize> {
++        if self.count == 0 {
++            return None;
++        }
++        let idx = self.head;
++        let n = self.lens[idx];
++        *out = self.bytes[idx];
++        self.head = (idx + 1) % IPC_QUEUE_DEPTH;
++        self.count -= 1;
++        Some(n)
+     }
+ }
+ 
+@@ -838,16 +885,17 @@ pub fn dispatch(ctx: &mut Context, mem: &mut MemoryPool, sched: &mut crate::sche
+             f.ipc_send_as_energy(src_pid, target_pid, magnitude)
+         })
+         .unwrap_or(false);
+-        // Byte transport alongside the energy transport: drop the message
+-        // into the target's mailbox slot (single slot, latest wins).
++        // Byte transport alongside the energy transport: queue the message
++        // in the target's mailbox ring (patch 0008; FIFO, drops oldest when
++        // full). Copy from userspace BEFORE taking the mailbox lock.
+         if target_pid < IPC_MAX_PIDS && len > 0 {
+-            let (boxes, mb_sif) = IPC_MAILBOXES.lock();
+-            let slot = &mut boxes[target_pid];
+             let n = len.min(IPC_MAX_BYTES);
++            let mut tmp = [0u8; IPC_MAX_BYTES];
+             for i in 0..n {
+-                slot.bytes[i] = unsafe { *(ptr.add(i)) };
++                tmp[i] = unsafe { *(ptr.add(i)) };
+             }
+-            slot.len = n;
++            let (boxes, mb_sif) = IPC_MAILBOXES.lock();
++            boxes[target_pid].push(&tmp[..n]);
+             IPC_MAILBOXES.unlock(mb_sif);
+         }
+         trap_frame.rax = if ok { 0 } else { u64::MAX };
+@@ -869,10 +917,10 @@ pub fn dispatch(ctx: &mut Context, mem: &mut MemoryPool, sched: &mut crate::sche
+         let mut mb_bytes = [0u8; IPC_MAX_BYTES];
+         if pid < IPC_MAX_PIDS {
+             let (boxes, mb_sif) = IPC_MAILBOXES.lock();
+-            if boxes[pid].len > 0 {
+-                mb_len = boxes[pid].len;
+-                mb_bytes = boxes[pid].bytes;
+-                boxes[pid].len = 0;
++            // Patch 0008: pop the OLDEST queued message; later messages
++            // stay queued for subsequent RECVs.
++            if let Some(n) = boxes[pid].pop(&mut mb_bytes) {
++                mb_len = n;
+             }
+             IPC_MAILBOXES.unlock(mb_sif);
+         }

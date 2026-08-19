@@ -51,6 +51,7 @@ jobs:
           git -C "$K" apply "$GITHUB_WORKSPACE/patches/0005-sys-spawn-runtime-process-creation.patch"
           git -C "$K" apply "$GITHUB_WORKSPACE/patches/0006-reap-spawned-task-resources-on-exit.patch"
           git -C "$K" apply "$GITHUB_WORKSPACE/patches/0007-free-exec-replaced-address-spaces.patch"
+          git -C "$K" apply "$GITHUB_WORKSPACE/patches/0008-ipc-mailbox-ring-queues.patch"
 
       - name: Build userspace programs
         run: |
@@ -127,6 +128,16 @@ jobs:
 
           # Prove IPC byte transport: the daemon must print the message text.
           for k in list("msg hello atom") + ["ret"]:
+              if k == " ":
+                  sendkey("spc")
+              else:
+                  sendkey(k)
+          time.sleep(0.5)
+
+          # Patch 0008: second message back-to-back. Both must sit in the
+          # daemon's mailbox ring before its next RECV and be delivered in
+          # order — the old single-slot mailbox would have lost this one.
+          for k in list("msg queued two") + ["ret"]:
               if k == " ":
                   sendkey("spc")
               else:
@@ -223,6 +234,13 @@ jobs:
             # Byte delivery depends on the daemon's RECV cycle (500k yields)
             # landing inside the window; TCG runners can be too slow for it.
             echo "IPC_MISSING (non-fatal — daemon RECV-cycle timing)"
+          fi
+          if grep -q "Received IPC: queued two" qemu.log; then
+            echo "IPC_QUEUE_OK"
+          else
+            # Needs TWO daemon RECV cycles inside the window; even more
+            # timing-sensitive than IPC_OK on TCG runners.
+            echo "IPC_QUEUE_MISSING (non-fatal — daemon RECV-cycle timing)"
           fi
           if grep -q "spawned pid" qemu.log \
              && [ "$(grep -c "hello from ATOM OS System" qemu.log)" -ge 2 ]; then

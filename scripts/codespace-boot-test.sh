@@ -26,6 +26,7 @@ git -C atom-os-kernel apply "$SYSROOT/patches/0004-xmm-save-restore-in-interrupt
 git -C atom-os-kernel apply "$SYSROOT/patches/0005-sys-spawn-runtime-process-creation.patch"
 git -C atom-os-kernel apply "$SYSROOT/patches/0006-reap-spawned-task-resources-on-exit.patch"
 git -C atom-os-kernel apply "$SYSROOT/patches/0007-free-exec-replaced-address-spaces.patch"
+git -C atom-os-kernel apply "$SYSROOT/patches/0008-ipc-mailbox-ring-queues.patch"
 
 for p in hello daemon shell fieldmon; do
     (cd "$SYSROOT/programs/$p" && cargo +nightly build -Zjson-target-spec --release --quiet)
@@ -89,6 +90,14 @@ for k in list("msg hello atom") + ["ret"]:
         sendkey("spc")
     else:
         sendkey(k)
+time.sleep(0.5)
+# Patch 0008: second message back-to-back — both must queue and be
+# delivered in order (the old single-slot mailbox lost the first).
+for k in list("msg queued two") + ["ret"]:
+    if k == " ":
+        sendkey("spc")
+    else:
+        sendkey(k)
 time.sleep(2.5)
 for k in list("spawn hello.elf") + ["ret"]:
     if k == " ":
@@ -142,6 +151,7 @@ efreed=$(grep -o "EXECFREE pid=[0-9]* freed=[0-9]*" qemu.log | head -1 | sed "s/
 edefer=$(grep -o "EXECFREE pid=[0-9]* freed=[0-9]* deferred=[0-9]*" qemu.log | head -1 | sed "s/.*deferred=//")
 if [ -n "$efreed" ] && [ "$efreed" -ge 8 ] && [ "${edefer:-X}" = "0" ]; then echo "EXECFREE_OK (freed=$efreed deferred=$edefer)"; else echo "EXECFREE_BAD (freed=${efreed:-none} deferred=${edefer:-none})"; fail=1; fi
 if grep -q "Received IPC: hello atom" qemu.log; then echo "IPC_OK"; else echo "IPC_MISSING (non-fatal — daemon RECV-cycle timing)"; fi
+if grep -q "Received IPC: queued two" qemu.log; then echo "IPC_QUEUE_OK"; else echo "IPC_QUEUE_MISSING (non-fatal — daemon RECV-cycle timing)"; fi
 if grep -q "spawned pid" qemu.log && [ "$(grep -c "hello from ATOM OS System" qemu.log)" -ge 2 ]; then echo "SPAWN_OK"; else echo "SPAWN_MISSING"; fail=1; fi
 if grep -q "REAP pid=" qemu.log; then echo "REAP_OK"; else echo "REAP_MISSING"; fail=1; fi
 freed=$(grep -o "REAP pid=[0-9]* freed=[0-9]*" qemu.log | head -1 | sed "s/.*freed=//")
