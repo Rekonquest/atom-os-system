@@ -120,3 +120,7 @@ msg <text>        send IPC to daemon (pid 2) — see IPC caveat above
 run <file.elf>    exec REPLACES the shell
 bench             10,000 SYS_YIELD cycle count (also runs once at boot)
 ```
+
+## License
+
+Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) (`PolyForm-Noncommercial-1.0.0`). Free for personal use, research, education, charities, public-good nonprofits, and government; commercial use is not permitted. This is source-available software, not OSI open source.
